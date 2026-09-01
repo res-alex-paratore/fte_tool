@@ -9,7 +9,6 @@ import { writeLog } from '@/lib/logger';
 
 export default function AllocationPage() {
   const [currentDate, setCurrentDate] = useState<Date | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
   const [calendarInitialized, setCalendarInitialized] = useState(false);
 
   useEffect(() => {
@@ -37,12 +36,6 @@ export default function AllocationPage() {
     initCalendar();
   }, []);
 
-  const handleRefresh = () => {
-    // The concept of refreshing a separate table is gone, but this can be used
-    // in the future to trigger a re-render of the grid if needed.
-    setRefreshKey(prevKey => prevKey + 1);
-  };
-  
   const isInitialLoading = !calendarInitialized || !currentDate;
 
   return (
@@ -51,10 +44,10 @@ export default function AllocationPage() {
         title="Weekly Allocation"
         description="Allocate FTEs for the current calendar month."
       />
+      {/* No onSaveSuccess: the saved allocations table is gone and the grid refetches itself. */}
       <MultiWeekGrid 
         currentDate={currentDate} 
         setCurrentDate={setCurrentDate} 
-        onSaveSuccess={handleRefresh}
         initialLoading={isInitialLoading}
       />
       {/* The saved allocations table has been removed. All work is now done in the grid above. */}

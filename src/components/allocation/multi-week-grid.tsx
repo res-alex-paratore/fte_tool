@@ -83,6 +83,19 @@ type AllocationRow = {
 };
 
 /**
+ * One pending write, carried alongside its request so a failure can be attributed.
+ *
+ * `fetch` only rejects on a network error, so a 403 or a 404 on a missing document resolves
+ * normally and is invisible unless the response is matched back to the operation that caused it.
+ */
+type SaveOperation = {
+  kind: 'DELETE' | 'PUT' | 'POST';
+  docId?: string;
+  weekKey?: string;
+  promise: Promise<Response>;
+};
+
+/**
  * Hydrate one client row's cells from its documents, restricted to the week keys on screen.
  *
  * `loaded` is the snapshot the save path diffs against; it must be built everywhere a row is
@@ -169,7 +182,9 @@ type EmployeeAllocation = {
 type MultiWeekGridProps = {
   currentDate: Date | null;
   setCurrentDate: (date: Date) => void;
-  onSaveSuccess: () => void;
+  // Optional: the grid refetches itself after a save. Only pages with a companion table to
+  // refresh need to pass this.
+  onSaveSuccess?: () => void;
   initialLoading: boolean;
 };
 
@@ -476,6 +491,49 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
     return weeks.every(w => !isWeekEditable(w.startDate));
   }, [weeks, isWeekEditable, todayRef]);
 
+  // fetchMonthData loads the previous month's documents as well and groups them into the
+  // same client rows, so deletion has to reach beyond the weeks currently rendered or
+  // those documents survive and rebuild the row on the next load. Locked weeks stay out.
+  const deletableWeekKeys = useMemo(() => {
+    if (!currentDate || !isValid(currentDate)) return new Set<string>();
+    const prevMonthWeeks = getWeeksForMonth(subMonths(currentDate, 1)) || [];
+    return new Set(
+      [...weeks, ...prevMonthWeeks]
+        .filter(w => isWeekEditable(w.startDate))
+        .map(w => formatDateKey(w.startDate))
+    );
+  }, [currentDate, weeks, isWeekEditable]);
+
+  // Resolve every document behind a row from the fetched documents, not just from the row's
+  // own docIds map, which hydrateCells fills for the visible month only. Rows are grouped by
+  // cost_center_name, so this also catches documents differing only in cost_center_number,
+  // which collide on the same docIds key and leave the loser undeletable.
+  const collectRowDocIds = useCallback((employeeId: string, row: AllocationRow) => {
+    const fromRow = Object.entries(row.docIds)
+      .filter(([weekKey, id]) => id && deletableWeekKeys.has(weekKey))
+      .map(([, id]) => id);
+
+    const clientName = String(row.clientName || '').trim();
+    const prefix = `[${employeeId}]`;
+    const fromCache = !clientName ? [] : monthDataCache
+      .filter(doc =>
+        doc?.content &&
+        String(doc.content.allocation_name || '').startsWith(prefix) &&
+        String(doc.content.cost_center_name || '').trim() === clientName &&
+        deletableWeekKeys.has(doc.content.allocation_date)
+      )
+      .map(doc => doc.id);
+
+    return Array.from(new Set([...fromRow, ...fromCache].filter(Boolean)));
+  }, [monthDataCache, deletableWeekKeys]);
+
+  // pendingDeletions holds ids resolved against the month that was on screen when the row
+  // was removed. Without this reset, navigating to another month and saving deletes the
+  // previous month's documents with nothing on screen to explain it.
+  useEffect(() => {
+    setPendingDeletions([]);
+  }, [currentDate]);
+
   const fetchMonthData = useCallback(async () => {
     if (!currentDate || !isValid(currentDate) || (weeks?.length || 0) === 0) return;
     setInternalLoading(true);
@@ -658,8 +716,8 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
       const empId = String(employeeId);
       const empAlloc = activeAllocations.find(ea => String(ea.employee?.person_id || ea.employee?.Person_Number) === empId);
       if (empAlloc) {
-          const ids = empAlloc.allocations.flatMap(a => Object.values(a.docIds)).filter(Boolean);
-          setPendingDeletions(prev => [...prev, ...ids]);
+          const ids = empAlloc.allocations.flatMap(a => collectRowDocIds(empId, a));
+          setPendingDeletions(prev => Array.from(new Set([...prev, ...ids])));
       }
       setActiveAllocations(prev => prev.filter(a => String(a.employee?.person_id || a.employee?.Person_Number) !== empId));
       setSelectedManager('');
@@ -717,8 +775,25 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
     const empAlloc = activeAllocations.find(ea => String(ea.employee?.person_id || ea.employee?.Person_Number) === empId);
     const rowToRemove = empAlloc?.allocations.find(a => a.id === allocId);
     if (rowToRemove) {
-        const ids = Object.values(rowToRemove.docIds).filter(Boolean);
-        setPendingDeletions(prev => [...prev, ...ids]);
+        const ids = collectRowDocIds(empId, rowToRemove);
+
+        // A row built from the collection that resolves to nothing deletable must not be
+        // dropped from the grid: that reports a delete which cannot happen, and is the exact
+        // failure users see as the entry coming back after a reload. The two causes need
+        // different messages — a week whose owning month has closed is not a lookup failure.
+        if (ids.length === 0 && Object.keys(rowToRemove.loaded).length > 0) {
+            const weekKeys = Object.keys(rowToRemove.docIds);
+            const lockedOnly = weekKeys.length > 0 && weekKeys.every(k => !deletableWeekKeys.has(k));
+            toast({
+                variant: 'destructive',
+                title: 'Cannot Delete Row',
+                description: lockedOnly
+                    ? 'This row only has allocations in weeks that are closed for editing.'
+                    : 'This row could not be matched to its saved records. Reload the page and try again.',
+            });
+            return;
+        }
+        setPendingDeletions(prev => Array.from(new Set([...prev, ...ids])));
     }
     setActiveAllocations(prev => (prev || []).map(ea => String(ea.employee?.person_id || ea.employee?.Person_Number) === empId ? { ...ea, allocations: ea.allocations.filter(a => a.id !== allocId) } : ea));
   };
@@ -726,7 +801,9 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
   const handleSave = async () => {
     if (!todayRef) return;
     setIsSaving(true);
-    const operations: Promise<any>[] = [];
+    // Labelled rather than bare promises: Promise.all resolves for a 4xx, so the status has
+    // to be read back per operation or the real cause never reaches the log.
+    const operations: SaveOperation[] = [];
     let invalid = false;
 
     // Keyed by week so the save can recover each cell's start date, which decides whether an
@@ -737,7 +814,11 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
 
     // Execute pending deletions first
     pendingDeletions.forEach(id => {
-        operations.push(fetch(`/domo/datastores/v1/collections/weekly_allocation/documents/${id}`, { method: 'DELETE' }));
+        operations.push({
+            kind: 'DELETE',
+            docId: id,
+            promise: fetch(`/domo/datastores/v1/collections/weekly_allocation/documents/${id}`, { method: 'DELETE' }),
+        });
     });
 
     activeAllocations.forEach(ea => {
@@ -783,22 +864,36 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
                     if (!amountChanged && !costCentreChanged) return;
 
                     const correction = correctionFieldsFor(loaded, { weekStart, today: todayRef, amountChanged, costCentreChanged });
-                    operations.push(fetch(`/domo/datastores/v1/collections/weekly_allocation/documents/${existingDocId}`, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ content: { ...content, ...correction } })
-                    }));
+                    operations.push({
+                        kind: 'PUT',
+                        docId: existingDocId,
+                        weekKey: key,
+                        promise: fetch(`/domo/datastores/v1/collections/weekly_allocation/documents/${existingDocId}`, {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ content: { ...content, ...correction } })
+                        }),
+                    });
                 } else {
-                    operations.push(fetch('/domo/datastores/v1/collections/weekly_allocation/documents/', { 
-                        method: 'POST', 
-                        headers: { 'Content-Type': 'application/json' }, 
-                        body: JSON.stringify({ content }) 
-                    }));
+                    operations.push({
+                        kind: 'POST',
+                        weekKey: key,
+                        promise: fetch('/domo/datastores/v1/collections/weekly_allocation/documents/', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ content })
+                        }),
+                    });
                 }
             } else if (existingDocId) {
                 // Cleared cell (or a negative, which is rejected the same way as before).
                 // Clearing remains the way to un-allocate.
-                operations.push(fetch(`/domo/datastores/v1/collections/weekly_allocation/documents/${existingDocId}`, { method: 'DELETE' }));
+                operations.push({
+                    kind: 'DELETE',
+                    docId: existingDocId,
+                    weekKey: key,
+                    promise: fetch(`/domo/datastores/v1/collections/weekly_allocation/documents/${existingDocId}`, { method: 'DELETE' }),
+                });
             }
           }
         });
@@ -809,12 +904,34 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
     if (operations.length === 0 && pendingDeletions.length === 0) { toast({ title: 'No changes to save.' }); setIsSaving(false); return; }
     
     try {
-        const results = await Promise.all(operations);
-        if (results.some(res => !res.ok)) throw new Error('One or more save operations failed.');
-        
+        const results = await Promise.all(operations.map(op => op.promise));
+        const failures = operations
+            .map((op, i) => ({ op, res: results[i] }))
+            .filter(({ res }) => !res.ok);
+
+        if (failures.length > 0) {
+            writeLog('MultiWeekGrid', 'error', 'Save operations failed', {
+                failures: failures.map(({ op, res }) => ({
+                    kind: op.kind,
+                    docId: op.docId,
+                    weekKey: op.weekKey,
+                    status: res.status,
+                })),
+            });
+            const statuses = Array.from(new Set(failures.map(({ res }) => res.status))).join(', ');
+            throw new Error(
+                `${failures.length} of ${operations.length} changes failed (HTTP ${statuses}). ` +
+                'Some changes may have been applied — reload the page before retrying.'
+            );
+        }
+
         toast({ title: 'Allocations Saved', description: 'Your changes have been synced successfully.' });
+        // Re-read the collection so docIds and loaded match what is actually stored. Without
+        // this, a document created by the POST above is never given an id in state, and the
+        // delete that follows resolves to nothing and silently does nothing.
         setPendingDeletions([]);
-        onSaveSuccess();
+        await fetchMonthData();
+        onSaveSuccess?.();
     } catch (error: any) { 
         writeLog('MultiWeekGrid', 'error', 'Save failed', error); 
         toast({ variant: 'destructive', title: 'Save Failed', description: error.message }); 
