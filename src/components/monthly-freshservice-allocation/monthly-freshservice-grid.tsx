@@ -21,13 +21,13 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { SelectSearch } from '@/components/ui/select-search';
-import { PlusCircle, Trash2, ChevronLeft, ChevronRight } from 'lucide-react';
+import { PlusCircle, Trash2, ChevronLeft, ChevronRight, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { normalizeHrRoster } from '@/lib/hr-roster';
 import { useToast } from '@/hooks/use-toast';
 import { Skeleton } from '../ui/skeleton';
 import { format, startOfMonth, addMonths, subMonths } from 'date-fns';
-import { TeamMember } from '@/types';
+import { TeamMember, WeeklyAllocation } from '@/types';
 import { ScrollArea } from '@/components/ui/scroll-area';
 
 type TicketAllocationData = {
@@ -55,6 +55,20 @@ type EmployeeAllocation = {
 
 type MonthlyFreshserviceGridProps = {
   onSaveSuccess: () => void;
+};
+
+/**
+ * One pending write, carried alongside its request so a failure can be attributed.
+ *
+ * `fetch` only rejects on a network error, so a 4xx resolves normally and is invisible unless the
+ * response is matched back to the operation that caused it.
+ */
+type SaveOperation = {
+  kind: 'DELETE' | 'PUT' | 'POST';
+  docId?: string;
+  agentName?: string;
+  clientName?: string;
+  promise: Promise<Response>;
 };
 
 // Employee Select Component
@@ -264,19 +278,23 @@ export function MonthlyFreshserviceGrid({ onSaveSuccess }: MonthlyFreshserviceGr
   };
 
   const handleRemoveAllocationRow = (agentName: string, allocId: string) => {
-    setActiveAllocations(prev => prev.map(empAlloc => {
-        if (empAlloc.agentName === agentName) {
-            // If it's the last row, remove the entire employee
-            if(empAlloc.allocations.length === 1) {
-                return null;
-            }
-            const newAllocations = empAlloc.allocations.filter(a => a.id !== allocId);
-            return { ...empAlloc, allocations: newAllocations };
-        }
-        return empAlloc;
-    }).filter(Boolean) as EmployeeAllocation[]);
+    // Removing the last row leaves the agent in the grid with nothing allocated rather than
+    // dropping them out of it. The save reconciles only the agents on screen, so removing the
+    // agent here would take their documents out of scope and quietly preserve the very rows the
+    // user just deleted. Nothing allocated is a valid state: the save withdraws them entirely.
+    setActiveAllocations(prev => prev.map(empAlloc => (
+        empAlloc.agentName === agentName
+            ? { ...empAlloc, allocations: empAlloc.allocations.filter(a => a.id !== allocId) }
+            : empAlloc
+    )));
   };
-  
+
+  /**
+   * Take an agent off the grid without touching their documents.
+   *
+   * Removal here is a view action, matching the weekly allocation grid. Withdrawing an agent's
+   * allocations is done by removing their rows and saving.
+   */
   const handleRemoveEmployee = (agentName: string) => {
       setActiveAllocations(prev => prev.filter(a => a.agentName !== agentName));
   }
@@ -292,29 +310,29 @@ export function MonthlyFreshserviceGrid({ onSaveSuccess }: MonthlyFreshserviceGr
     const selectedMonth = format(currentDate, 'MMM');
     const selectedYear = format(currentDate, 'yyyy');
     
-    const submissions: any[] = [];
     let hasValidationError = false;
+
+    // Desired state for every agent on screen: agentName -> clientName -> fte.
+    const desired = new Map<string, Map<string, number>>();
 
     activeAllocations.forEach(empAlloc => {
       const totalFte = empAlloc.allocations.reduce((sum, alloc) => sum + alloc.fte, 0);
-      if (Math.abs(totalFte - 1.0) > 0.01) { // Allow for small floating point inaccuracies
+      // An agent with nothing allocated is being withdrawn, which is a valid outcome rather than a
+      // validation failure — their documents are deleted below. Only a partial allocation is wrong.
+      if (totalFte > 0.01 && Math.abs(totalFte - 1.0) > 0.01) {
           toast({ variant: 'destructive', title: `Validation Error for ${empAlloc.agentName}`, description: `Total allocation must be 1.0, but it is ${totalFte.toFixed(3)}.` });
           hasValidationError = true;
           return;
       }
+      // Sum rather than overwrite: the reconcile keys on agent + cost centre, and the Add
+      // Allocation button produces rows whose name is a readOnly 'MANUAL ENTRY', so two rows can
+      // legitimately share a name. Overwriting would drop their FTE and write less than the 1.0
+      // the user sees totalled on screen.
+      const rows = new Map<string, number>();
       empAlloc.allocations.forEach(alloc => {
-        if (alloc.fte > 0) {
-          submissions.push({
-            content: {
-              allocation_date: allocationDate,
-              allocation_name: empAlloc.agentName,
-              cost_center_name: alloc.clientName,
-              cost_center_number: alloc.clientName, // Using name as number for this use case
-              allocation_amount: alloc.fte.toString(),
-            }
-          });
-        }
+        if (alloc.fte > 0) rows.set(alloc.clientName, (rows.get(alloc.clientName) || 0) + alloc.fte);
       });
+      desired.set(empAlloc.agentName, rows);
     });
 
     if (hasValidationError) {
@@ -322,26 +340,117 @@ export function MonthlyFreshserviceGrid({ onSaveSuccess }: MonthlyFreshserviceGr
         return;
     }
 
-    if (submissions.length === 0) {
+    if (desired.size === 0) {
       toast({ title: 'No changes to save.' });
       setIsSubmitting(false);
       return;
     }
 
+    const collectionUrl = '/domo/datastores/v1/collections/weekly_allocation/documents/';
+
     try {
-        await Promise.all(submissions.map(entry =>
-            fetch('/domo/datastores/v1/collections/weekly_allocation/documents/', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(entry),
-            }).then(res => {
-                if (!res.ok) throw new Error('One or more saves failed.');
-                return res.json();
-            })
-        ));
+        // Read what is already stored for this month, so the save can update and remove rather than
+        // only create. Without this every save re-created every row, so editing duplicated an entry
+        // and removing a row left its document behind.
+        const storedRes = await fetch(`/domo/datastores/v1/collections/weekly_allocation/documents?q=content.allocation_date='${allocationDate}'`);
+        if (!storedRes.ok) throw new Error(`Could not read existing allocations (HTTP ${storedRes.status}).`);
+        const stored: WeeklyAllocation[] = await storedRes.json();
+
+        // Only documents this page owns. The weekly allocation grid always writes
+        // allocation_name as '[personId] Name', so an exact match on a bare agent name cannot
+        // reach its rows. Agents absent from the grid are left alone entirely.
+        const mine = stored.filter(doc => doc?.content && desired.has(String(doc.content.allocation_name || '')));
+
+        const operations: SaveOperation[] = [];
+        const claimed = new Set<string>();
+
+        mine.forEach(doc => {
+            const agentName = String(doc.content.allocation_name);
+            const clientName = String(doc.content.cost_center_name || '');
+            const key = `${agentName}|${clientName}`;
+            const want = desired.get(agentName)!.get(clientName);
+
+            // Claim the first document for a given agent and client; any further copy is a
+            // duplicate from the old create-only save and is removed here.
+            if (typeof want === 'number' && !claimed.has(key)) {
+                claimed.add(key);
+                if (parseFloat(doc.content.allocation_amount || '') === want) return;
+                operations.push({
+                    kind: 'PUT',
+                    docId: doc.id,
+                    agentName,
+                    clientName,
+                    promise: fetch(`${collectionUrl}${doc.id}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content: {
+                            allocation_date: allocationDate,
+                            allocation_name: agentName,
+                            cost_center_name: clientName,
+                            cost_center_number: clientName, // Using name as number for this use case
+                            allocation_amount: want.toString(),
+                        }}),
+                    }),
+                });
+                return;
+            }
+
+            operations.push({
+                kind: 'DELETE',
+                docId: doc.id,
+                agentName,
+                clientName,
+                promise: fetch(`${collectionUrl}${doc.id}`, { method: 'DELETE' }),
+            });
+        });
+
+        desired.forEach((rows, agentName) => {
+            rows.forEach((fte, clientName) => {
+                if (claimed.has(`${agentName}|${clientName}`)) return;
+                operations.push({
+                    kind: 'POST',
+                    agentName,
+                    clientName,
+                    promise: fetch(collectionUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content: {
+                            allocation_date: allocationDate,
+                            allocation_name: agentName,
+                            cost_center_name: clientName,
+                            cost_center_number: clientName, // Using name as number for this use case
+                            allocation_amount: fte.toString(),
+                        }}),
+                    }),
+                });
+            });
+        });
+
+        if (operations.length === 0) {
+            toast({ title: 'No changes to save.' });
+            setIsSubmitting(false);
+            return;
+        }
+
+        const results = await Promise.all(operations.map(op => op.promise));
+        const failures = operations
+            .map((op, i) => ({ op, res: results[i] }))
+            .filter(({ res }) => !res.ok);
+
+        if (failures.length > 0) {
+            const statuses = Array.from(new Set(failures.map(({ res }) => res.status))).join(', ');
+            console.error('Save operations failed', failures.map(({ op, res }) => ({
+                kind: op.kind, docId: op.docId, agentName: op.agentName, clientName: op.clientName, status: res.status,
+            })));
+            throw new Error(
+                `${failures.length} of ${operations.length} changes failed (HTTP ${statuses}). ` +
+                'Some changes may have been applied — reload the page before retrying.'
+            );
+        }
+
         toast({
             title: 'Allocations Saved',
-            description: `${submissions.length} allocation entries for ${selectedMonth} ${selectedYear} have been saved successfully.`,
+            description: `${operations.length} change(s) for ${selectedMonth} ${selectedYear} have been saved successfully.`,
         });
         onSaveSuccess();
     } catch (error: any) {
@@ -417,12 +526,12 @@ export function MonthlyFreshserviceGrid({ onSaveSuccess }: MonthlyFreshserviceGr
                       <TableRow className="bg-muted/50 hover:bg-muted">
                         <TableCell className="font-semibold sticky left-0 bg-muted/50 z-10">{agentName}</TableCell>
                         <TableCell></TableCell>
-                        <TableCell className={cn("text-center font-semibold", Math.abs(totalFte - 1.0) > 0.01 ? "text-destructive" : "text-muted-foreground")}>
+                        <TableCell className={cn("text-center font-semibold", totalFte > 0.01 && Math.abs(totalFte - 1.0) > 0.01 ? "text-destructive" : "text-muted-foreground")}>
                           {totalFte > 0 ? totalFte.toFixed(3) : '-'}
                         </TableCell>
                         <TableCell className='text-right'>
-                          <Button variant="ghost" size="icon" onClick={() => handleRemoveEmployee(agentName)} disabled={isSubmitting}>
-                            <Trash2 className="h-4 w-4 text-destructive" />
+                          <Button variant="ghost" size="icon" title="Remove from grid (does not delete allocations)" onClick={() => handleRemoveEmployee(agentName)} disabled={isSubmitting}>
+                            <X className="h-4 w-4 text-muted-foreground" />
                           </Button>
                         </TableCell>
                       </TableRow>
