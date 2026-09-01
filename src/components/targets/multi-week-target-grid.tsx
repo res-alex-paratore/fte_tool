@@ -15,12 +15,13 @@ import {
 } from '@/components/ui/table';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command';
-import { ChevronLeft, ChevronRight, PlusCircle, Trash2, Check, ChevronsUpDown, Loader2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, PlusCircle, Trash2, Check, ChevronsUpDown, Loader2, X } from 'lucide-react';
 import { useCurrentUser } from '@/hooks/use-current-user';
 import type { TeamMember, WeeklyTarget } from '@/types';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { Skeleton } from '../ui/skeleton';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { v4 as uuidv4 } from 'uuid';
 import { writeLog } from '@/lib/logger';
 import { getFullName, getPersonId, normalizeHrRoster } from '@/lib/hr-roster';
@@ -44,6 +45,66 @@ type TargetRow = {
   clientId: string;
   clientName: string;
   quarterlyTargets: { [quarterKey: string]: number };
+  // The document behind each quarter's cell. Without these the save path can only POST, so
+  // editing a target duplicated it and removing a row left the document in place.
+  docIds: { [quarterKey: string]: string };
+  // Snapshot to diff against, so an untouched quarter is not rewritten on every save.
+  loaded: { [quarterKey: string]: number };
+  loadedClientId?: string;
+  loadedClientName?: string;
+};
+
+/**
+ * One pending write, carried alongside its request so a failure can be attributed.
+ *
+ * `fetch` only rejects on a network error, so a 4xx resolves normally and is invisible unless the
+ * response is matched back to the operation that caused it.
+ */
+type SaveOperation = {
+  kind: 'DELETE' | 'PUT' | 'POST';
+  docId?: string;
+  quarter?: string;
+  promise: Promise<Response>;
+};
+
+const blankTargetRow = (): TargetRow => ({
+  id: uuidv4(), clientId: '', clientName: '', quarterlyTargets: {}, docIds: {}, loaded: {},
+});
+
+/**
+ * Build one employee's target rows from their documents, grouped by cost centre.
+ *
+ * Shared by the year fetch and both add paths, which previously each carried their own copy of
+ * this grouping and all three dropped the document ids on the floor.
+ */
+const hydrateTargetRows = (docs: WeeklyTarget[]): TargetRow[] => {
+  if (docs.length === 0) return [blankTargetRow()];
+
+  const byCostCentre = new Map<string, TargetRow>();
+  docs.forEach(doc => {
+    const clientKey = doc.content.targets_cost_center_number;
+    if (!byCostCentre.has(clientKey)) {
+      byCostCentre.set(clientKey, {
+        id: uuidv4(),
+        clientId: clientKey,
+        clientName: doc.content.targets_cost_center_name,
+        quarterlyTargets: {},
+        docIds: {},
+        loaded: {},
+        loadedClientId: clientKey,
+        loadedClientName: doc.content.targets_cost_center_name,
+      });
+    }
+    const row = byCostCentre.get(clientKey)!;
+    const date = new Date(doc.content.targets_allocation_date);
+    const quarter = quarters[Math.floor(date.getUTCMonth() / 3)];
+    const amount = parseInt(doc.content.targets_allocation_amount, 10) || 0;
+    row.quarterlyTargets[quarter] = amount;
+    row.docIds[quarter] = doc.id;
+    row.loaded[quarter] = amount;
+  });
+
+  return Array.from(byCostCentre.values());
 };
 
 type EmployeeTarget = {
@@ -317,6 +378,7 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
   const [selectedEmployeeToAdd, setSelectedEmployeeToAdd] = useState('');
   const [selectedManager, setSelectedManager] = useState<string>('');
   const [isSaving, setIsSaving] = useState(false);
+  const [pendingDeletions, setPendingDeletions] = useState<string[]>([]);
   const [hasMounted, setHasMounted] = useState(false);
 
   const { isAdmin, loading: userLoading } = useCurrentUser();
@@ -325,6 +387,12 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
   useEffect(() => {
     setHasMounted(true);
   }, []);
+
+  // Queued ids belong to the year that was on screen when the row was removed. Without this reset,
+  // changing year and saving would delete that other year's documents unprompted.
+  useEffect(() => {
+    setPendingDeletions([]);
+  }, [currentYear]);
 
   const fetchYearData = useCallback(async () => {
     if (!currentYear) return;
@@ -342,30 +410,7 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
             const empId = empTarget.employee.person_id || empTarget.employee.Person_Number;
             const employeeIdString = `[${empId}]`;
             const employeeTargets = safeTargets.filter(t => t.content.targets_allocation_name?.startsWith(employeeIdString));
-            
-            if (employeeTargets.length === 0) {
-                return { ...empTarget, targets: [{ id: uuidv4(), clientId: '', clientName: '', quarterlyTargets: {} }] };
-            }
-
-            const clientTargetsMap = new Map<string, { clientName: string, quarterlyTargets: { [key: string]: number } }>();
-            employeeTargets.forEach(target => {
-                const clientKey = target.content.targets_cost_center_number;
-                if (!clientTargetsMap.has(clientKey)) {
-                    clientTargetsMap.set(clientKey, { clientName: target.content.targets_cost_center_name, quarterlyTargets: {} });
-                }
-                const date = new Date(target.content.targets_allocation_date);
-                const quarterIndex = Math.floor(date.getUTCMonth() / 3);
-                clientTargetsMap.get(clientKey)!.quarterlyTargets[quarters[quarterIndex]] = parseInt(target.content.targets_allocation_amount, 10) || 0;
-            });
-
-            const newTargetRows = Array.from(clientTargetsMap.entries()).map(([clientId, data]) => ({
-                id: uuidv4(),
-                clientId,
-                clientName: data.clientName,
-                quarterlyTargets: data.quarterlyTargets,
-            }));
-
-            return { ...empTarget, targets: newTargetRows };
+            return { ...empTarget, targets: hydrateTargetRows(employeeTargets) };
         }));
 
     } catch (error) {
@@ -443,29 +488,7 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
       const employeeIdString = `[${id}]`;
       const employeeTargets = (yearDataCache || []).filter(t => t.content.targets_allocation_name?.startsWith(employeeIdString));
       
-      let rows: TargetRow[] = [];
-      if (employeeTargets.length === 0) {
-          rows = [{ id: uuidv4(), clientId: '', clientName: '', quarterlyTargets: {} }];
-      } else {
-          const clientTargetsMap = new Map<string, { clientName: string, quarterlyTargets: { [key: string]: number } }>();
-          employeeTargets.forEach(target => {
-              const clientKey = target.content.targets_cost_center_number;
-              if (!clientTargetsMap.has(clientKey)) {
-                  clientTargetsMap.set(clientKey, { clientName: target.content.targets_cost_center_name, quarterlyTargets: {} });
-              }
-              const date = new Date(target.content.targets_allocation_date);
-              const quarterIndex = Math.floor(date.getUTCMonth() / 3);
-              clientTargetsMap.get(clientKey)!.quarterlyTargets[quarters[quarterIndex]] = parseInt(target.content.targets_allocation_amount, 10) || 0;
-          });
-          rows = Array.from(clientTargetsMap.entries()).map(([clientId, data]) => ({
-              id: uuidv4(),
-              clientId,
-              clientName: data.clientName,
-              quarterlyTargets: data.quarterlyTargets,
-          }));
-      }
-      
-      setActiveTargets(prev => [{ employee: employeeToAdd, targets: rows }, ...prev]);
+      setActiveTargets(prev => [{ employee: employeeToAdd, targets: hydrateTargetRows(employeeTargets) }, ...prev]);
     }
     setTimeout(() => setSelectedEmployeeToAdd(''), 0);
   };
@@ -491,34 +514,19 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
         const employeeIdString = `[${empId}]`;
         const employeeTargets = (yearDataCache || []).filter(t => t.content.targets_allocation_name?.startsWith(employeeIdString));
         
-        let rows: TargetRow[] = [];
-        if (employeeTargets.length === 0) {
-            rows = [{ id: uuidv4(), clientId: '', clientName: '', quarterlyTargets: {} }];
-        } else {
-            const clientTargetsMap = new Map<string, { clientName: string, quarterlyTargets: { [key: string]: number } }>();
-            employeeTargets.forEach(target => {
-                const clientKey = target.content.targets_cost_center_number;
-                if (!clientTargetsMap.has(clientKey)) {
-                    clientTargetsMap.set(clientKey, { clientName: target.content.targets_cost_center_name, quarterlyTargets: {} });
-                }
-                const date = new Date(target.content.targets_allocation_date);
-                const quarterIndex = Math.floor(date.getUTCMonth() / 3);
-                clientTargetsMap.get(clientKey)!.quarterlyTargets[quarters[quarterIndex]] = parseInt(target.content.targets_allocation_amount, 10) || 0;
-            });
-            rows = Array.from(clientTargetsMap.entries()).map(([clientId, data]) => ({
-                id: uuidv4(),
-                clientId,
-                clientName: data.clientName,
-                quarterlyTargets: data.quarterlyTargets,
-            }));
-        }
-        return { employee, targets: rows };
+        return { employee, targets: hydrateTargetRows(employeeTargets) };
     });
 
     setActiveTargets(newEmployeeTargets);
     toast({ title: 'Team Loaded', description: `Loaded ${newEmployeeTargets.length} members for ${managerName}.` });
   };
 
+  /**
+   * Take an employee off the grid without touching their documents.
+   *
+   * Removal here is a view action, matching the weekly allocation grid. Withdrawing a target is
+   * done by clearing the quarter or deleting the client row, both of which reach the collection.
+   */
   const handleRemoveEmployee = (employeeId: string) => {
       const empId = String(employeeId);
       setActiveTargets(prev => prev.filter(a => String(a.employee?.person_id || a.employee?.Person_Number) !== empId));
@@ -544,55 +552,136 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
 
   const handleAddTargetRow = (employeeId: string) => {
     setActiveTargets(prev => prev.map(emp => (String(emp.employee.person_id || emp.employee.Person_Number) === String(employeeId) ? {
-      ...emp, targets: [...emp.targets, { id: uuidv4(), clientId: '', clientName: '', quarterlyTargets: {} }]
+      ...emp, targets: [...emp.targets, blankTargetRow()]
     } : emp)));
   };
 
   const handleRemoveTargetRow = (employeeId: string, rowId: string) => {
-    setActiveTargets(prev => prev.map(emp => (String(emp.employee.person_id || emp.employee.Person_Number) === String(employeeId) ? {
-      ...emp, targets: emp.targets.filter(r => r.id !== rowId)
-    } : emp)));
+    const emp = activeTargets.find(e => String(e.employee?.person_id || e.employee?.Person_Number) === String(employeeId));
+    const rowToRemove = emp?.targets.find(r => r.id === rowId);
+    if (rowToRemove) {
+        const ids = Object.values(rowToRemove.docIds).filter(Boolean);
+        setPendingDeletions(prev => Array.from(new Set([...prev, ...ids])));
+    }
+    setActiveTargets(prev => prev.map(e => {
+      if (String(e.employee.person_id || e.employee.Person_Number) !== String(employeeId)) return e;
+      const remaining = e.targets.filter(r => r.id !== rowId);
+      // Every employee renders at least one row, so removing the last one collapses to a blank
+      // row rather than an empty array. Its documents are still queued for deletion above.
+      return { ...e, targets: remaining.length > 0 ? remaining : [blankTargetRow()] };
+    }));
   };
 
   const handleSave = async () => {
     setIsSaving(true);
-    const submissions: any[] = [];
+    // Labelled rather than bare promises: Promise.all resolves for a 4xx, so the status has to be
+    // read back per operation or the real cause never reaches the log.
+    const operations: SaveOperation[] = [];
     let hasInvalidTarget = false;
+
+    const collectionUrl = '/domo/datastores/v1/collections/weekly_targets/documents/';
+
+    pendingDeletions.forEach(id => {
+        operations.push({
+            kind: 'DELETE',
+            docId: id,
+            promise: fetch(`${collectionUrl}${id}`, { method: 'DELETE' }),
+        });
+    });
 
     activeTargets.forEach(emp => {
       emp.targets.forEach(row => {
-        Object.entries(row.quarterlyTargets).forEach(([quarter, target]) => {
-          if (target > 0) {
+        // Every quarter, not just the keys present: a quarter the user cleared has to be able to
+        // reach its existing document and delete it.
+        quarters.forEach(quarter => {
+          const target = row.quarterlyTargets[quarter];
+          const existingDocId = row.docIds[quarter];
+
+          if (typeof target === 'number' && target > 0) {
              if (!row.clientId || !row.clientName) {
                 hasInvalidTarget = true;
                 toast({ variant: 'destructive', title: 'Missing Client', description: `Please select a client for ${emp.employee.full_name || emp.employee.Full_Name}.` });
                 return;
             }
-            submissions.push({ content: {
+            const content = {
                 targets_allocation_date: getQuarterStartDate(currentYear, quarter),
                 targets_allocation_name: `[${emp.employee.person_id || emp.employee.Person_Number}] ${emp.employee.full_name || emp.employee.Full_Name}`,
                 targets_cost_center_name: row.clientName,
                 targets_cost_center_number: row.clientId,
                 targets_allocation_amount: target.toString(),
-            }});
+            };
+
+            if (existingDocId) {
+                // Skip untouched quarters. Without this every save rewrites every loaded cell.
+                const amountChanged = row.loaded[quarter] !== target;
+                const costCentreChanged = row.loadedClientId !== row.clientId
+                    || row.loadedClientName !== row.clientName;
+                if (!amountChanged && !costCentreChanged) return;
+
+                operations.push({
+                    kind: 'PUT',
+                    docId: existingDocId,
+                    quarter,
+                    promise: fetch(`${collectionUrl}${existingDocId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content }),
+                    }),
+                });
+            } else {
+                operations.push({
+                    kind: 'POST',
+                    quarter,
+                    promise: fetch(collectionUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content }),
+                    }),
+                });
+            }
+          } else if (existingDocId) {
+            // Cleared or zeroed: the target is being withdrawn, so the document goes.
+            operations.push({
+                kind: 'DELETE',
+                docId: existingDocId,
+                quarter,
+                promise: fetch(`${collectionUrl}${existingDocId}`, { method: 'DELETE' }),
+            });
           }
         });
       });
     });
 
     if (hasInvalidTarget) { setIsSaving(false); return; }
-    if (submissions.length === 0) { toast({ title: 'No changes to save.' }); setIsSaving(false); return; }
+    if (operations.length === 0) { toast({ title: 'No changes to save.' }); setIsSaving(false); return; }
 
     try {
-        await Promise.all(submissions.map(entry => 
-            fetch('/domo/datastores/v1/collections/weekly_targets/documents/', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(entry),
-            }).then(res => { if (!res.ok) throw new Error('One or more saves failed.') })
-        ));
-        toast({ title: 'Targets Saved', description: `${submissions.length} target entries saved for ${currentYear}.` });
-        writeLog('QuarterlyTargetGrid', 'success', 'Targets saved', { count: submissions.length, year: currentYear });
+        const results = await Promise.all(operations.map(op => op.promise));
+        const failures = operations
+            .map((op, i) => ({ op, res: results[i] }))
+            .filter(({ res }) => !res.ok);
+
+        if (failures.length > 0) {
+            writeLog('QuarterlyTargetGrid', 'error', 'Save operations failed', {
+                year: currentYear,
+                failures: failures.map(({ op, res }) => ({
+                    kind: op.kind, docId: op.docId, quarter: op.quarter, status: res.status,
+                })),
+            });
+            const statuses = Array.from(new Set(failures.map(({ res }) => res.status))).join(', ');
+            throw new Error(
+                `${failures.length} of ${operations.length} changes failed (HTTP ${statuses}). ` +
+                'Some changes may have been applied — reload the page before retrying.'
+            );
+        }
+
+        toast({ title: 'Targets Saved', description: `${operations.length} change(s) saved for ${currentYear}.` });
+        writeLog('QuarterlyTargetGrid', 'success', 'Targets saved', { count: operations.length, year: currentYear });
+        // Re-read so docIds and loaded match what is stored. Without this a document created by
+        // the POST above is never given an id, and the next edit duplicates it instead of
+        // updating it while a removal silently does nothing.
+        setPendingDeletions([]);
+        await fetchYearData();
         onSaveSuccess();
     } catch (error: any) {
         writeLog('QuarterlyTargetGrid', 'error', 'Save failed', error);
@@ -605,6 +694,7 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
   const pageIsLoading = internalLoading || userLoading;
 
   return (
+    <TooltipProvider>
     <Card>
       <CardHeader>
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
@@ -650,7 +740,16 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
                         </TableCell>
                         <TableCell></TableCell>
                         {quarters.map(q => <TableCell key={q} className="text-center font-semibold text-muted-foreground">{(targets || []).reduce((sum, row) => sum + (parseInt(row.quarterlyTargets[q]?.toString()) || 0), 0) || '-'}</TableCell>)}
-                        <TableCell className='text-right'><Button variant="ghost" size="icon" onClick={() => handleRemoveEmployee(employee.person_id || employee.Person_Number)} disabled={isSaving}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                        <TableCell className='text-right'>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button variant="ghost" size="icon" onClick={() => handleRemoveEmployee(employee.person_id || employee.Person_Number)} disabled={isSaving}>
+                                <X className="h-4 w-4 text-muted-foreground" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent><p>Remove from grid (does not delete targets)</p></TooltipContent>
+                          </Tooltip>
+                        </TableCell>
                       </TableRow>
                       {(targets || []).map(row => (
                         <TableRow key={row.id}>
@@ -665,7 +764,7 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
                                 />
                               </TableCell>
                           ))}
-                          <TableCell className='text-right'><Button variant="ghost" size="icon" onClick={() => handleRemoveTargetRow(employee.person_id || employee.Person_Number, row.id)} disabled={targets.length <= 1 || isSaving}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                          <TableCell className='text-right'><Button variant="ghost" size="icon" onClick={() => handleRemoveTargetRow(employee.person_id || employee.Person_Number, row.id)} disabled={isSaving}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
                         </TableRow>
                       ))}
                       <TableRow>
@@ -681,5 +780,6 @@ export function QuarterlyTargetGrid({ currentYear, setCurrentYear, onSaveSuccess
         </div>
       </CardContent>
     </Card>
+    </TooltipProvider>
   );
 }
