@@ -16,7 +16,7 @@ import {
 } from '@/components/ui/table';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command';
-import { ChevronLeft, ChevronRight, PlusCircle, Trash2, Lock, Check, ChevronsUpDown, Loader2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, PlusCircle, Trash2, Lock, Check, ChevronsUpDown, Loader2, X } from 'lucide-react';
 import { useCurrentUser } from '@/hooks/use-current-user';
 import type { TeamMember, WeeklyAllocation } from '@/types';
 import { cn } from '@/lib/utils';
@@ -712,13 +712,18 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
     toast({ title: 'Team Loaded', description: `Loaded ${newAllocations.length} members for ${managerName}.` });
   };
 
+  /**
+   * Take an employee off the grid without touching their documents.
+   *
+   * This must never delete. handleAddEmployee hydrates an added person's existing allocations out
+   * of monthDataCache, which holds every document for the month regardless of manager, so a name
+   * picked by accident arrives populated with allocations somebody else owns. Deleting here
+   * destroyed another manager's data on a click that reads as tidying up the view.
+   *
+   * Un-allocating stays explicit: clear the cells, or delete the client row.
+   */
   const handleRemoveEmployee = (employeeId: string) => {
       const empId = String(employeeId);
-      const empAlloc = activeAllocations.find(ea => String(ea.employee?.person_id || ea.employee?.Person_Number) === empId);
-      if (empAlloc) {
-          const ids = empAlloc.allocations.flatMap(a => collectRowDocIds(empId, a));
-          setPendingDeletions(prev => Array.from(new Set([...prev, ...ids])));
-      }
       setActiveAllocations(prev => prev.filter(a => String(a.employee?.person_id || a.employee?.Person_Number) !== empId));
       setSelectedManager('');
   };
@@ -795,7 +800,20 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
         }
         setPendingDeletions(prev => Array.from(new Set([...prev, ...ids])));
     }
-    setActiveAllocations(prev => (prev || []).map(ea => String(ea.employee?.person_id || ea.employee?.Person_Number) === empId ? { ...ea, allocations: ea.allocations.filter(a => a.id !== allocId) } : ea));
+    setActiveAllocations(prev => (prev || []).map(ea => {
+        if (String(ea.employee?.person_id || ea.employee?.Person_Number) !== empId) return ea;
+        const remaining = ea.allocations.filter(a => a.id !== allocId);
+        // Every employee renders at least one row, so removing the last one collapses to a fresh
+        // blank row rather than an empty array — the same shape handleAddEmployee and
+        // handleAddManagerTeam use for an employee with no documents. Its documents are still
+        // queued for deletion above.
+        return {
+            ...ea,
+            allocations: remaining.length > 0
+                ? remaining
+                : [{ id: uuidv4(), clientId: '', clientName: '', weeklyFtes: {}, docIds: {}, loaded: {} }],
+        };
+    }));
   };
 
   const handleSave = async () => {
@@ -1048,7 +1066,16 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
                               </TableCell>
                             )
                         })}
-                        <TableCell className='text-right'><Button variant="ghost" size="icon" onClick={() => handleRemoveEmployee(employee.person_id || employee.Person_Number)} disabled={isSaving || isMonthLocked}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                        <TableCell className='text-right'>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button variant="ghost" size="icon" onClick={() => handleRemoveEmployee(employee.person_id || employee.Person_Number)} disabled={isSaving || isMonthLocked}>
+                                <X className="h-4 w-4 text-muted-foreground" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent><p>Remove from grid (does not delete allocations)</p></TooltipContent>
+                          </Tooltip>
+                        </TableCell>
                       </TableRow>
                       {(allocations || []).map((alloc) => {
                         const weekKey0 = (weeks?.length || 0) > 0 ? formatDateKey(weeks[0].startDate) : '';
@@ -1072,7 +1099,7 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
                               </TableCell>
                             )
                           })}
-                          <TableCell className='text-right'><Button variant="ghost" size="icon" onClick={() => handleRemoveAllocationRow(employee.person_id || employee.Person_Number, alloc.id)} disabled={allocations.length === 1 || isMonthLocked || isSaving}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                          <TableCell className='text-right'><Button variant="ghost" size="icon" onClick={() => handleRemoveAllocationRow(employee.person_id || employee.Person_Number, alloc.id)} disabled={isMonthLocked || isSaving}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
                         </TableRow>
                       )})}
                       <TableRow>
