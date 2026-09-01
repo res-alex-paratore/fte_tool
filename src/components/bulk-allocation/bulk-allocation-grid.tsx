@@ -658,9 +658,9 @@ export function BulkAllocationGrid({ onSaveSuccess, templateToCopy }: BulkAlloca
                     <SelectValue placeholder="Select Group" />
                     </SelectTrigger>
                     <SelectContent>
-                    <SelectItem value="Contractor Care">Contractor Care</SelectItem>
-                    <SelectItem value="Compliance">Compliance</SelectItem>
-                    <SelectItem value="NAM MSP Admin">NAM MSP Admin</SelectItem>
+                    <SelectItem value="Business Services Compliance">Business Services Compliance</SelectItem>
+                    <SelectItem value="Business Services Contractor Care">Business Services Contractor Care</SelectItem>
+                    <SelectItem value="Business Services MSP NAM">Business Services MSP NAM</SelectItem>
                     <SelectItem value="Other">Other</SelectItem>
                     </SelectContent>
                 </Select>
