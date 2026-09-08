@@ -42,6 +42,25 @@ const formatDateKey = (date: Date) => format(startOfWeek(date, { weekStartsOn: 1
 const monthValue = (date: Date) => date.getFullYear() * 12 + date.getMonth();
 
 /**
+ * How many calendar months back stay open for editing, counting back from the current month.
+ *
+ * 1 was too tight while managers were still being onboarded: access arrived with too little of
+ * July left to complete it, and the month closed before they could. Widened to 2 so the window
+ * does not have to be nudged again during ramp-up.
+ *
+ * This is the only place the window is defined — isWeekEditable and the grid's description both
+ * derive from it. A week's month is its owning month (the month containing its Friday), not the
+ * month its Monday falls in, so a week can be open while the calendar month it starts in is not.
+ */
+// Typed as number, not the literal 2: this is meant to be retuned, and a literal type would
+// make the singular branch of EDITABLE_WINDOW_LABEL a compile error.
+const EDITABLE_MONTHS_BACK: number = 2;
+
+const EDITABLE_WINDOW_LABEL = EDITABLE_MONTHS_BACK === 1
+  ? 'the current and previous calendar month'
+  : `the current month and the previous ${EDITABLE_MONTHS_BACK} calendar months`;
+
+/**
  * A weekly cell's value.
  *
  * '' means the user explicitly emptied the cell; a missing key means nobody has
@@ -467,8 +486,8 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
   const isWeekEditable = useCallback((weekStartDate: Date) => {
     if (!todayRef) return false;
 
-    // Weeks before the previous calendar month are closed for editing.
-    return monthValue(getOwningMonth(weekStartDate)) >= (monthValue(todayRef) - 1);
+    // Weeks whose owning month falls outside the EDITABLE_MONTHS_BACK window are closed.
+    return monthValue(getOwningMonth(weekStartDate)) >= (monthValue(todayRef) - EDITABLE_MONTHS_BACK);
   }, [todayRef]);
 
   const isMonthLocked = useMemo(() => {
@@ -846,7 +865,7 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
                 )}
               </div>
               <CardDescription>
-                Edits permitted for current and previous calendar months only. Sorted by first name.
+                Edits permitted for {EDITABLE_WINDOW_LABEL} only. Sorted by first name.
               </CardDescription>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
