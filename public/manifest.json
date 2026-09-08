@@ -301,7 +301,7 @@
                     }
                 ]
             },
-            "syncEnabled": false,
+            "syncEnabled": true,
             "defaultPermission": [
                 "read",
                 "read_content",
@@ -335,7 +335,7 @@
                     }
                 ]
             },
-            "syncEnabled": false,
+            "syncEnabled": true,
             "defaultPermission": [
                 "read",
                 "read_content",
@@ -361,7 +361,7 @@
                     }
                 ]
             },
-            "syncEnabled": false,
+            "syncEnabled": true,
             "defaultPermission": [
                 "read",
                 "read_content",
@@ -395,7 +395,7 @@
                     }
                 ]
             },
-            "syncEnabled": false,
+            "syncEnabled": true,
             "defaultPermission": [
                 "read",
                 "read_content",
@@ -429,7 +429,7 @@
                     }
                 ]
             },
-            "syncEnabled": false,
+            "syncEnabled": true,
             "defaultPermission": [
                 "read",
                 "read_content",
@@ -595,7 +595,7 @@
                     }
                 ]
             },
-            "syncEnabled": false,
+            "syncEnabled": true,
             "defaultPermission": [
                 "read",
                 "read_content",
