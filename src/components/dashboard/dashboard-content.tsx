@@ -159,7 +159,7 @@ export function DashboardContent() {
     department: [] as string[]
   });
   const [chartClientFilter, setChartClientFilter] = useState<string[]>([]);
-  const [chartView, setChartView] = useState<'weekly' | 'bulk' | 'freshservice' | 'total'>('weekly');
+  const [chartView, setChartView] = useState<'weekly' | 'bulk' | 'freshservice'>('weekly');
   
   const { toast } = useToast();
   
@@ -529,18 +529,13 @@ export function DashboardContent() {
              description = `Total FTEs assigned per client from Freshservice ticket ratios in ${monthLabel}.`;
              break;
         }
-        case 'total':
         case 'weekly':
         default: {
-            const isTotal = chartView === 'total';
-            const weeksCount = isTotal ? 8 : 6;
             const allWeeklyClients = Array.from(new Set((weeklyAllocations || []).map(a => String(a?.content?.cost_center_name)).filter(c => c && c !== 'undefined')));
             // Weekly is framed on the current fiscal month, from the same helper the table uses, so
             // the chart beside it covers exactly the same weeks. Total stays a rolling trend — that
             // view exists to show movement over time, which one month cannot.
-            const lastPeriod = isTotal
-              ? Array.from({ length: weeksCount }, (_, i) => startOfWeek(subWeeks(selectedDate, (weeksCount - 1) - i), { weekStartsOn: 1 }))
-              : monthWeekKeysFor(selectedDate).map(k => startOfWeek(parseISO(k), { weekStartsOn: 1 }));
+            const lastPeriod = monthWeekKeysFor(selectedDate).map(k => startOfWeek(parseISO(k), { weekStartsOn: 1 }));
             initialChartData = lastPeriod.map(weekStart => {
               const weekKey = format(weekStart, 'yyyy-MM-dd');
               const allocationsForWeek = (weeklyAllocations || []).filter(a => {
@@ -559,10 +554,8 @@ export function DashboardContent() {
               allWeeklyClients.forEach(client => { if (client) completeWeeklyData[client as string] = weeklyTotals[client as string] || 0; });
               return completeWeeklyData;
             });
-            title = isTotal ? "Total FTE Allocation Trend" : "Weekly Client Allocation";
-            description = isTotal
-              ? `FTEs allocated per client over the 8 weeks up to ${monthLabel}.`
-              : `Total FTEs allocated per client, by week of ${monthLabel}.`;
+            title = "Weekly Client Allocation";
+            description = `Total FTEs allocated per client, by week of ${monthLabel}.`;
             break;
         }
     }
@@ -611,17 +604,6 @@ export function DashboardContent() {
   return (
     <div className="flex flex-col gap-8">
       <PageHeader title="Dashboard" />
-      <div className="flex items-center justify-center gap-2">
-        <Button variant="outline" size="icon" onClick={handlePrevMonth} disabled={isPageLoading}>
-          <ChevronLeft className="h-4 w-4" />
-        </Button>
-        <span className="text-sm font-medium w-40 text-center">
-          {isPageLoading || !selectedDate ? <Skeleton className="h-5 w-32 mx-auto" /> : format(selectedDate, 'MMMM yyyy')}
-        </span>
-        <Button variant="outline" size="icon" onClick={handleNextMonth} disabled={isPageLoading}>
-          <ChevronRight className="h-4 w-4" />
-        </Button>
-      </div>
       <div className="grid gap-4 md:grid-cols-3">
         <SummaryCard title="Total FTEs" value={isPageLoading ? <Skeleton className="h-8 w-1/2" /> : (Number.isNaN(totalFteVal) ? '0.00' : totalFteVal.toFixed(2))} icon={Users} onClick={() => handleCardClick('total')} isActive={activeView === 'total'} />
         <SummaryCard title="Allocated FTEs" value={isPageLoading ? <Skeleton className="h-8 w-1/2" /> : (Number.isNaN(allocatedFteVal) ? '0.00' : allocatedFteVal.toFixed(2))} icon={Briefcase} onClick={() => handleCardClick('allocated')} isActive={activeView === 'allocated'} />
@@ -630,38 +612,23 @@ export function DashboardContent() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           <Card>
             <CardHeader>
-              <div className="flex flex-col sm:flex-row sm:justify-between sm:items-start gap-4">
-                <div className="flex-1">
-                  <CardTitle>{isPageLoading ? <Skeleton className="h-6 w-2/3" /> : chartState.chartTitle}</CardTitle>
-                  <CardDescription>{isPageLoading ? <Skeleton className="h-4 w-full" /> : chartState.chartDescription}</CardDescription>
-                </div>
-                <Tabs value={chartView} onValueChange={(v) => setChartView(v as any)} className="w-full sm:w-auto">
-                    <TabsList className="grid w-full grid-cols-2 sm:grid-cols-4 h-auto sm:h-10">
-                        <TabsTrigger value="weekly">Weekly</TabsTrigger>
-                        <TabsTrigger value="bulk">Bulk</TabsTrigger>
-                        <TabsTrigger value="freshservice">Freshservice</TabsTrigger>
-                        <TabsTrigger value="total">Total</TabsTrigger>
-                    </TabsList>
-                </Tabs>
-              </div>
-               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-4">
-                  <MultiSelectFilter placeholder="Filter by Client..." options={allChartClients} selected={chartClientFilter} onValueChange={handleChartClientFilterChange} disabled={isPageLoading} />
-                  <Button variant="outline" onClick={clearChartFilters} disabled={isPageLoading || chartClientFilter.length === 0}>Clear Client Filter</Button>
-              </div>
-              <p className="text-xs text-muted-foreground pt-2">
-                Showing the employees listed in the table — use its filters, and the cards above, to narrow both.
-              </p>
-            </CardHeader>
-            <CardContent>{isPageLoading ? <Skeleton className="h-[400px] w-full" /> : <FteAllocationChart data={chartState.chartData} />}</CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
                <div className="flex justify-between items-start gap-4">
                     <div>
                         <CardTitle>{isPageLoading ? <Skeleton className="h-6 w-1/3" /> : detailState.title}</CardTitle>
                         <CardDescription>{isPageLoading ? <Skeleton className="h-4 w-2/3" /> : detailState.description}</CardDescription>
                     </div>
-                    <Button variant="outline" size="sm" onClick={clearEmployeeFilters} disabled={isPageLoading}>Clear Filters</Button>
+                    <div className="flex items-center gap-2 shrink-0">
+                        <Button variant="outline" size="icon" onClick={handlePrevMonth} disabled={isPageLoading} aria-label="Previous month">
+                          <ChevronLeft className="h-4 w-4" />
+                        </Button>
+                        <span className="text-sm font-medium w-28 text-center">
+                          {isPageLoading || !selectedDate ? <Skeleton className="h-5 w-24 mx-auto" /> : format(selectedDate, 'MMMM yyyy')}
+                        </span>
+                        <Button variant="outline" size="icon" onClick={handleNextMonth} disabled={isPageLoading} aria-label="Next month">
+                          <ChevronRight className="h-4 w-4" />
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={clearEmployeeFilters} disabled={isPageLoading}>Clear Filters</Button>
+                    </div>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 pt-4">
                     <MultiSelectFilter placeholder="Name..." options={employeeFilterOptions.fullNames} selected={employeeFilters.fullName} onValueChange={value => handleEmployeeFilterChange('fullName', value)} disabled={isPageLoading} />
@@ -712,6 +679,31 @@ export function DashboardContent() {
                 </Table>
               </ScrollArea>
             </CardContent>
+          </Card>
+          <Card>
+            <CardHeader>
+              <div className="flex flex-col sm:flex-row sm:justify-between sm:items-start gap-4">
+                <div className="flex-1">
+                  <CardTitle>{isPageLoading ? <Skeleton className="h-6 w-2/3" /> : chartState.chartTitle}</CardTitle>
+                  <CardDescription>{isPageLoading ? <Skeleton className="h-4 w-full" /> : chartState.chartDescription}</CardDescription>
+                </div>
+                <Tabs value={chartView} onValueChange={(v) => setChartView(v as any)} className="w-full sm:w-auto">
+                    <TabsList className="grid w-full grid-cols-3 h-auto sm:h-10">
+                        <TabsTrigger value="weekly">Weekly</TabsTrigger>
+                        <TabsTrigger value="bulk">Bulk</TabsTrigger>
+                        <TabsTrigger value="freshservice">Freshservice</TabsTrigger>
+                    </TabsList>
+                </Tabs>
+              </div>
+               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-4">
+                  <MultiSelectFilter placeholder="Filter by Client..." options={allChartClients} selected={chartClientFilter} onValueChange={handleChartClientFilterChange} disabled={isPageLoading} />
+                  <Button variant="outline" onClick={clearChartFilters} disabled={isPageLoading || chartClientFilter.length === 0}>Clear Client Filter</Button>
+              </div>
+              <p className="text-xs text-muted-foreground pt-2">
+                Showing the employees listed in the table on the left — use its filters, and the cards above, to narrow both.
+              </p>
+            </CardHeader>
+            <CardContent>{isPageLoading ? <Skeleton className="h-[400px] w-full" /> : <FteAllocationChart data={chartState.chartData} />}</CardContent>
           </Card>
       </div>
     </div>
