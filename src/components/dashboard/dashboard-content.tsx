@@ -15,7 +15,7 @@ import { startOfWeek, subWeeks, format, isValid, parseISO } from 'date-fns';
 import { PageHeader } from '../page-header';
 import { writeLog } from '@/lib/logger';
 import { normalizeHrRoster } from '@/lib/hr-roster';
-import { formatAllocationMonthYear, getOwningMonth } from '@/lib/fiscal-calendar';
+import { formatAllocationMonthYear, getWeeksForMonth } from '@/lib/fiscal-calendar';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import { Button } from '../ui/button';
@@ -210,14 +210,15 @@ export function DashboardContent() {
     }
 
     const safeEmployees = filteredEmployeesBase;
-    const startOfThisWeek = startOfWeek(today, { weekStartsOn: 1 });
-    const currentWeekKey = format(startOfThisWeek, 'yyyy-MM-dd');
-    const currentWeekAllocations = (weeklyAllocations || []).filter(a => a?.content?.allocation_date === currentWeekKey);
-    
-    // The bulk period is the current week's *owning* fiscal month, not today's calendar month.
-    // Near a month boundary those differ — a week starting 31 Aug is owned by September — and
-    // using today's month would compare this week against the wrong month's profiles.
-    const currentMonthYear = formatAllocationMonthYear(getOwningMonth(startOfThisWeek));
+
+    // Both this table and the Weekly chart are framed on the current fiscal month, taken from the
+    // same calendar helper the allocation grid uses so the weeks line up with what managers edit.
+    const monthWeekKeys = new Set(
+      (getWeeksForMonth(today) || []).map(w => format(startOfWeek(w.startDate, { weekStartsOn: 1 }), 'yyyy-MM-dd'))
+    );
+    const monthAllocations = (weeklyAllocations || []).filter(a => a?.content?.allocation_date && monthWeekKeys.has(a.content.allocation_date));
+
+    const currentMonthYear = formatAllocationMonthYear(today);
 
     // The two branches are alternative ways of allocating the same person for the same week, so
     // they are accumulated separately and combined per employee below rather than summed. A bulk
@@ -228,21 +229,36 @@ export function DashboardContent() {
     const weeklyFteMap = new Map<string, number>();
     const bulkFteMap = new Map<string, number>();
 
-    currentWeekAllocations
-      .filter(a => a?.content && (parseFloat(a.content.allocation_amount || '0') || 0) > 0)
-      .forEach(a => {
-        let empId = a?.content?.employee_id || '';
-        if (!empId && a?.content?.allocation_name) {
-          const match = String(a.content.allocation_name).match(/\[(.*?)\]/);
+    // Monthly figure is SUM(allocation_amount) / weeks-that-have-a-row, matching the Domo cards
+    // (DASHBOARD_HANDOVER.md 10.1). Note there is no `> 0` filter: an explicit 0 is a real entry
+    // and has to reach the denominator, because that is how a partial month is recorded — users
+    // zero the weeks somebody is not allocated rather than the app writing a placeholder row for
+    // every person and client. Dropping zeros here would silently restore the over-report.
+    const weeklyWeeksWithData = new Map<string, Set<string>>();
+
+    monthAllocations.forEach(a => {
+        const content = a?.content;
+        if (!content) return;
+
+        const amount = parseFloat(content.allocation_amount || '0');
+        if (!Number.isFinite(amount)) return;
+
+        let empId = content.employee_id || '';
+        if (!empId && content.allocation_name) {
+          const match = String(content.allocation_name).match(/\[(.*?)\]/);
           if (match && match[1]) empId = match[1];
         }
-        
-        if (empId) {
-            const currentAmount = weeklyFteMap.get(empId) || 0;
-            const nextAmount = currentAmount + (parseFloat(a.content.allocation_amount || '0') || 0);
-            weeklyFteMap.set(empId, Number.isNaN(nextAmount) ? currentAmount : nextAmount);
-        }
-      });
+        if (!empId) return;
+
+        weeklyFteMap.set(empId, (weeklyFteMap.get(empId) || 0) + amount);
+        if (!weeklyWeeksWithData.has(empId)) weeklyWeeksWithData.set(empId, new Set<string>());
+        weeklyWeeksWithData.get(empId)!.add(content.allocation_date);
+    });
+
+    weeklyWeeksWithData.forEach((weeks, empId) => {
+        const total = weeklyFteMap.get(empId) || 0;
+        weeklyFteMap.set(empId, weeks.size > 0 ? total / weeks.size : 0);
+    });
 
     const profileCapacityMap = new Map<string, number>();
     const profileAssignments = (bulkFtes || []).filter(f => f?.content?.allocation_monthyear === currentMonthYear);
@@ -514,7 +530,12 @@ export function DashboardContent() {
             const isTotal = chartView === 'total';
             const weeksCount = isTotal ? 8 : 6;
             const allWeeklyClients = Array.from(new Set((weeklyAllocations || []).map(a => String(a?.content?.cost_center_name)).filter(c => c && c !== 'undefined')));
-            const lastPeriod = Array.from({ length: weeksCount }, (_, i) => startOfWeek(subWeeks(today, (weeksCount - 1) - i), { weekStartsOn: 1 }));
+            // Weekly is framed on the current fiscal month, from the same helper the table uses, so
+            // the chart beside it covers exactly the same weeks. Total stays a rolling trend — that
+            // view exists to show movement over time, which one month cannot.
+            const lastPeriod = isTotal
+              ? Array.from({ length: weeksCount }, (_, i) => startOfWeek(subWeeks(today, (weeksCount - 1) - i), { weekStartsOn: 1 }))
+              : (getWeeksForMonth(today) || []).map(w => startOfWeek(w.startDate, { weekStartsOn: 1 }));
             initialChartData = lastPeriod.map(weekStart => {
               const weekKey = format(weekStart, 'yyyy-MM-dd');
               const allocationsForWeek = (weeklyAllocations || []).filter(a => {
@@ -534,7 +555,9 @@ export function DashboardContent() {
               return completeWeeklyData;
             });
             title = isTotal ? "Total FTE Allocation Trend" : "Weekly Client Allocation";
-            description = isTotal ? "FTEs allocated per client (Weekly) over the last 8 weeks." : "Total FTEs allocated per client over the last 6 weeks.";
+            description = isTotal
+              ? "FTEs allocated per client (Weekly) over the last 8 weeks."
+              : `Total FTEs allocated per client, by week of ${format(today, 'MMMM yyyy')}.`;
             break;
         }
     }
@@ -555,8 +578,8 @@ export function DashboardContent() {
     let baseTitle: string = 'FTE List';
     switch (activeView) {
       case 'total': baseData = filteredEmployeesBase; baseTitle = 'All FTEs'; break;
-      case 'allocated': baseData = stats.allocatedEmployees; baseTitle = 'Allocated FTEs (Current Week)'; break;
-      case 'unallocated': baseData = stats.unallocatedEmployees; baseTitle = 'Unallocated FTEs (Current Week)'; break;
+      case 'allocated': baseData = stats.allocatedEmployees; baseTitle = 'Allocated FTEs (Current Month)'; break;
+      case 'unallocated': baseData = stats.unallocatedEmployees; baseTitle = 'Unallocated FTEs (Current Month)'; break;
       default: baseData = filteredEmployeesBase; baseTitle = 'All FTEs';
     }
     
