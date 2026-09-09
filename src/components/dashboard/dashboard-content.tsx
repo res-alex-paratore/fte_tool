@@ -15,7 +15,7 @@ import { startOfWeek, subWeeks, format, isValid, parseISO } from 'date-fns';
 import { PageHeader } from '../page-header';
 import { writeLog } from '@/lib/logger';
 import { normalizeHrRoster } from '@/lib/hr-roster';
-import { formatAllocationMonthYear } from '@/lib/fiscal-calendar';
+import { formatAllocationMonthYear, getOwningMonth } from '@/lib/fiscal-calendar';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import { Button } from '../ui/button';
@@ -214,10 +214,20 @@ export function DashboardContent() {
     const currentWeekKey = format(startOfThisWeek, 'yyyy-MM-dd');
     const currentWeekAllocations = (weeklyAllocations || []).filter(a => a?.content?.allocation_date === currentWeekKey);
     
-    const currentMonthYear = formatAllocationMonthYear(today);
+    // The bulk period is the current week's *owning* fiscal month, not today's calendar month.
+    // Near a month boundary those differ — a week starting 31 Aug is owned by September — and
+    // using today's month would compare this week against the wrong month's profiles.
+    const currentMonthYear = formatAllocationMonthYear(getOwningMonth(startOfThisWeek));
 
-    const allocatedFteMap = new Map<string, number>();
-    
+    // The two branches are alternative ways of allocating the same person for the same week, so
+    // they are accumulated separately and combined per employee below rather than summed. A bulk
+    // profile cannot be saved unless its allocation equals its members' total FTE
+    // (bulk-allocation-grid.tsx handleSave), so profile membership already means a person is fully
+    // allocated for that month. Adding weekly rows on top double-counted them, which is what
+    // showed 2.00 for anyone allocated both ways.
+    const weeklyFteMap = new Map<string, number>();
+    const bulkFteMap = new Map<string, number>();
+
     currentWeekAllocations
       .filter(a => a?.content && (parseFloat(a.content.allocation_amount || '0') || 0) > 0)
       .forEach(a => {
@@ -228,9 +238,9 @@ export function DashboardContent() {
         }
         
         if (empId) {
-            const currentAmount = allocatedFteMap.get(empId) || 0;
+            const currentAmount = weeklyFteMap.get(empId) || 0;
             const nextAmount = currentAmount + (parseFloat(a.content.allocation_amount || '0') || 0);
-            allocatedFteMap.set(empId, Number.isNaN(nextAmount) ? currentAmount : nextAmount);
+            weeklyFteMap.set(empId, Number.isNaN(nextAmount) ? currentAmount : nextAmount);
         }
       });
 
@@ -275,11 +285,20 @@ export function DashboardContent() {
                     const individualShare = (profileFteAmount / groupCapacity) * baseFte;
                     if (!isFinite(individualShare)) return;
 
-                    const current = allocatedFteMap.get(empId) || 0;
-                    allocatedFteMap.set(empId, current + (Number.isNaN(individualShare) ? 0 : individualShare));
+                    const current = bulkFteMap.get(empId) || 0;
+                    bulkFteMap.set(empId, current + (Number.isNaN(individualShare) ? 0 : individualShare));
                 });
             }
         }
+    });
+
+    // Whichever branch claims more of the person's capacity wins. Max rather than a fixed
+    // precedence: it cannot understate someone whose profile covers them in full but who also has
+    // a small stray weekly row, and it still surfaces genuine over-allocation within one branch
+    // (weekly rows totalling 1.20 continue to read 1.20).
+    const allocatedFteMap = new Map<string, number>();
+    new Set([...weeklyFteMap.keys(), ...bulkFteMap.keys()]).forEach(empId => {
+        allocatedFteMap.set(empId, Math.max(weeklyFteMap.get(empId) || 0, bulkFteMap.get(empId) || 0));
     });
 
     let totalBaseFteSum = 0;
