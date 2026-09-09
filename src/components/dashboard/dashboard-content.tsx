@@ -2,20 +2,20 @@
 'use client';
 
 import { useEffect, useState, useMemo } from 'react';
-import { Users, Briefcase, UserMinus, ChevronsUpDown } from 'lucide-react';
+import { Users, Briefcase, UserMinus, ChevronsUpDown, ChevronLeft, ChevronRight } from 'lucide-react';
 import SummaryCard from '@/components/dashboard/summary-card';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import type { TeamMember, WeeklyAllocation, BulkFteDoc, BulkSummaryDoc, WeeklyTarget } from '@/types';
+import type { TeamMember, WeeklyAllocation, BulkFteDoc, BulkSummaryDoc } from '@/types';
 import { useToast } from '@/hooks/use-toast';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
 import FteAllocationChart from '@/components/dashboard/fte-allocation-chart';
-import { startOfWeek, subWeeks, format, isValid, parseISO } from 'date-fns';
+import { startOfWeek, subWeeks, addWeeks, addDays, addMonths, subMonths, startOfMonth, isSameMonth, format, isValid, parseISO } from 'date-fns';
 import { PageHeader } from '../page-header';
 import { writeLog } from '@/lib/logger';
 import { normalizeHrRoster } from '@/lib/hr-roster';
-import { formatAllocationMonthYear, getWeeksForMonth } from '@/lib/fiscal-calendar';
+import { formatAllocationMonthYear, getWeeksForMonth, initializeFiscalCalendar, type FiscalCalendarEntry } from '@/lib/fiscal-calendar';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import { Button } from '../ui/button';
@@ -113,6 +113,30 @@ const MultiSelectFilter = ({
 };
 
 
+/**
+ * The Monday keys of the fiscal month containing `date`.
+ *
+ * Prefers the 4-4-5 calendar so these match the weeks the allocation grid offers. Falls back to
+ * generating them when that dataset is unavailable: getWeeksForMonth reads a module-level singleton
+ * that only initializeFiscalCalendar fills, and an empty result would silently show every weekly
+ * allocation as 0.00 rather than failing visibly.
+ */
+const monthWeekKeysFor = (date: Date): string[] => {
+  const fromCalendar = (getWeeksForMonth(date) || [])
+    .map(w => format(startOfWeek(w.startDate, { weekStartsOn: 1 }), 'yyyy-MM-dd'));
+  if (fromCalendar.length > 0) return fromCalendar;
+
+  // Same rule as getOwningMonth: a week belongs to the month containing its Friday.
+  const keys: string[] = [];
+  let cursor = startOfWeek(startOfMonth(subWeeks(date, 2)), { weekStartsOn: 1 });
+  const limit = addWeeks(startOfMonth(date), 7);
+  while (cursor <= limit) {
+    if (isSameMonth(addDays(cursor, 4), date)) keys.push(format(cursor, 'yyyy-MM-dd'));
+    cursor = addWeeks(cursor, 1);
+  }
+  return keys;
+};
+
 export function DashboardContent() {
   const [loading, setLoading] = useState(true);
   const [today, setToday] = useState<Date | null>(null);
@@ -122,7 +146,10 @@ export function DashboardContent() {
   const [weeklyAllocations, setWeeklyAllocations] = useState<WeeklyAllocation[]>([]);
   const [bulkFtes, setBulkFtes] = useState<BulkFteDoc[]>([]);
   const [bulkSummaries, setBulkSummaries] = useState<BulkSummaryDoc[]>([]);
-  const [targets, setTargets] = useState<WeeklyTarget[]>([]);
+
+  // The month the whole page is framed on. Every figure and every chart uses this, so the scroller
+  // moves the table and the chart together.
+  const [selectedDate, setSelectedDate] = useState<Date | null>(null);
 
   const [activeView, setActiveView] = useState<ActiveView>('total');
   const [employeeFilters, setEmployeeFilters] = useState({ 
@@ -132,43 +159,54 @@ export function DashboardContent() {
     department: [] as string[]
   });
   const [chartClientFilter, setChartClientFilter] = useState<string[]>([]);
-  const [chartDepartmentFilter, setChartDepartmentFilter] = useState<string[]>([]);
-  const [chartView, setChartView] = useState<'weekly' | 'bulk' | 'freshservice' | 'targets' | 'total'>('weekly');
+  const [chartView, setChartView] = useState<'weekly' | 'bulk' | 'freshservice' | 'total'>('weekly');
   
   const { toast } = useToast();
   
   useEffect(() => {
     setHasMounted(true);
-    setToday(new Date());
+    const now = new Date();
+    setToday(now);
+    setSelectedDate(now);
 
     async function fetchData() {
       setLoading(true);
       try {
         const [
+          calendarResponse,
           empResponse,
           weeklyAllocResponse,
           bulkFteResponse,
           bulkSummaryResponse,
-          targetsResponse,
         ] = await Promise.all([
+          fetch(`/data/v1/global_445_calendar`),
           fetch(`/data/v1/consolidated_hr_fte_report_view`),
           fetch(`/domo/datastores/v1/collections/weekly_allocation/documents/`),
           fetch(`/domo/datastores/v1/collections/bulk_allocation_fte/documents/`),
           fetch(`/domo/datastores/v1/collections/bulk_allocation_summary/documents/`),
-          fetch(`/domo/datastores/v1/collections/weekly_targets/documents/`),
         ]);
+
+        // The fiscal calendar is a module-level singleton, and only the Allocation page used to
+        // fill it. Reaching this page directly left getWeeksForMonth returning nothing, which
+        // showed every weekly allocation as 0.00. Initialise it here too — the call is idempotent.
+        if (calendarResponse.ok) {
+          const calendarData: Omit<FiscalCalendarEntry, 'parsedDate'>[] = await calendarResponse.json();
+          initializeFiscalCalendar(calendarData);
+        } else {
+          writeLog('DashboardContent', 'warning', 'Failed to load 4-4-5 calendar, using generated weeks', {
+            status: calendarResponse.status,
+          });
+        }
 
         const rawEmps = empResponse.ok ? await empResponse.json() : [];
         const rawWeekly = weeklyAllocResponse.ok ? await weeklyAllocResponse.json() : [];
         const rawBFtes = bulkFteResponse.ok ? await bulkFteResponse.json() : [];
         const rawBSums = bulkSummaryResponse.ok ? await bulkSummaryResponse.json() : [];
-        const rawTargs = targetsResponse.ok ? await targetsResponse.json() : [];
 
         setAllEmployees(normalizeHrRoster(rawEmps));
         setWeeklyAllocations(Array.isArray(rawWeekly) ? rawWeekly.filter(a => a?.content) : []);
         setBulkFtes(Array.isArray(rawBFtes) ? rawBFtes.filter(f => f?.content) : []);
         setBulkSummaries(Array.isArray(rawBSums) ? rawBSums.filter(s => s?.content) : []);
-        setTargets(Array.isArray(rawTargs) ? rawTargs.filter(t => t?.content) : []);
 
       } catch (error) {
         writeLog('DashboardContent', 'error', 'Failed to load dashboard data', error);
@@ -205,7 +243,7 @@ export function DashboardContent() {
   }, [allEmployees, employeeFilters, hasMounted]);
 
   const stats = useMemo(() => {
-    if (!today || !hasMounted || loading) {
+    if (!selectedDate || !hasMounted || loading) {
       return { totalFtes: 0, allocatedFtes: 0, unallocatedFtes: 0, allocatedEmployees: [], unallocatedEmployees: [], allocatedFteMap: new Map<string, number>() };
     }
 
@@ -213,12 +251,10 @@ export function DashboardContent() {
 
     // Both this table and the Weekly chart are framed on the current fiscal month, taken from the
     // same calendar helper the allocation grid uses so the weeks line up with what managers edit.
-    const monthWeekKeys = new Set(
-      (getWeeksForMonth(today) || []).map(w => format(startOfWeek(w.startDate, { weekStartsOn: 1 }), 'yyyy-MM-dd'))
-    );
+    const monthWeekKeys = new Set(monthWeekKeysFor(selectedDate));
     const monthAllocations = (weeklyAllocations || []).filter(a => a?.content?.allocation_date && monthWeekKeys.has(a.content.allocation_date));
 
-    const currentMonthYear = formatAllocationMonthYear(today);
+    const currentMonthYear = formatAllocationMonthYear(selectedDate);
 
     // The two branches are alternative ways of allocating the same person for the same week, so
     // they are accumulated separately and combined per employee below rather than summed. A bulk
@@ -340,7 +376,18 @@ export function DashboardContent() {
       unallocatedEmployees: unallocatedEmps,
       allocatedFteMap
     };
-  }, [today, hasMounted, loading, filteredEmployeesBase, weeklyAllocations, bulkFtes, bulkSummaries, allEmployees]);
+  }, [selectedDate, hasMounted, loading, filteredEmployeesBase, weeklyAllocations, bulkFtes, bulkSummaries, allEmployees]);
+
+  // The chart shows only the employees the table is showing, so the employee filters and the
+  // selected tile drive both halves of the page from one place.
+  const tableEmployeeIds = useMemo(() => {
+    const source = activeView === 'allocated' ? stats.allocatedEmployees
+      : activeView === 'unallocated' ? stats.unallocatedEmployees
+      : filteredEmployeesBase;
+    return new Set(
+      (source || []).map(e => String(e?.person_id || e?.Person_Number || '')).filter(Boolean)
+    );
+  }, [activeView, stats, filteredEmployeesBase]);
 
   const employeeFilterOptions = useMemo<FilterOptions>(() => {
     const safeEmployees = (allEmployees || []).filter(e => e && (e.person_id || e.Person_Number));
@@ -367,55 +414,35 @@ export function DashboardContent() {
     const clientsSet = new Set<string>();
     (weeklyAllocations || []).forEach(a => { if (a?.content?.cost_center_name) clientsSet.add(String(a.content.cost_center_name)); });
     (bulkSummaries || []).forEach(s => { if (s?.content?.cost_center_name) clientsSet.add(String(s.content.cost_center_name)); });
-    (targets || []).forEach(t => { if (t?.content?.targets_allocation_name) clientsSet.add(String(t.content.targets_cost_center_name)); });
-    
+
     return Array.from(clientsSet)
       .filter(c => typeof c === 'string' && c)
       .sort((a,b) => a.localeCompare(b));
-  }, [loading, hasMounted, weeklyAllocations, bulkSummaries, targets]);
-
-  const allChartDepartments = useMemo<string[]>(() => {
-    if (loading || !hasMounted) return [];
-    const depts = new Set<string>();
-    (allEmployees || []).forEach(e => { if (e && (e.department || e.Team_Name)) depts.add((e.department || e.Team_Name)!); });
-    return Array.from(depts).sort((a, b) => a.localeCompare(b));
-  }, [loading, hasMounted, allEmployees]);
+  }, [loading, hasMounted, weeklyAllocations, bulkSummaries]);
 
   const chartState = useMemo(() => {
-    if (!today || !hasMounted || loading) {
+    if (!selectedDate || !hasMounted || loading) {
         return { chartData: [], chartTitle: 'Loading Chart...', chartDescription: '...'};
     }
 
     const currentChartClientFilter = chartClientFilter || [];
-    const currentChartDepartmentFilter = chartDepartmentFilter || [];
-    const monthsShort = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const monthLabel = format(selectedDate, 'MMMM yyyy');
+    const selectedMonthYear = formatAllocationMonthYear(selectedDate);
+    const selectedYearMonth = format(selectedDate, 'yyyy-MM');
 
     const localAllEmployees = allEmployees || [];
-    const getEmployeeDept = (id?: string, name?: string) => {
-        if (!localAllEmployees || localAllEmployees.length === 0) return '';
-        let dept = '';
-        if (id) {
-            const emp = localAllEmployees.find(e => e && (e.person_id === id || e.Person_Number === id));
-            dept = emp?.department || emp?.Team_Name || '';
-        }
-        if (!dept && name) {
-            const match = String(name).match(/\[(.*?)\]/);
-            const targetId = match ? match[1] : null;
-            if (targetId) {
-                const emp = localAllEmployees.find(e => e && (e.person_id === targetId || e.Person_Number === targetId));
-                dept = emp?.department || emp?.Team_Name || '';
-            } else {
-                const emp = localAllEmployees.find(e => e && (e.full_name === name || e.Full_Name === name));
-                dept = emp?.department || emp?.Team_Name || '';
-            }
-        }
-        return dept;
-    };
 
-    const checkDeptMatch = (id?: string, name?: string) => {
-        if (currentChartDepartmentFilter.length === 0) return true;
-        const dept = getEmployeeDept(id, name);
-        return !!dept && currentChartDepartmentFilter.includes(dept);
+    // Resolve an allocation row to a person — by employee_id, by the [id] prefix the weekly and
+    // targets grids write, or by the bare name the Freshservice and ratio grids write — then keep
+    // the row only if that person is in the table.
+    const matchesTable = (id?: string, name?: string) => {
+        if (id && tableEmployeeIds.has(String(id))) return true;
+        if (!name) return false;
+        const match = String(name).match(/\[(.*?)\]/);
+        if (match && match[1]) return tableEmployeeIds.has(match[1]);
+        const emp = localAllEmployees.find(e => e && (e.full_name === name || e.Full_Name === name));
+        const empId = emp ? String(emp.person_id || emp.Person_Number || '') : '';
+        return !!empId && tableEmployeeIds.has(empId);
     };
 
     let initialChartData: ChartData[] = [];
@@ -441,10 +468,14 @@ export function DashboardContent() {
                 }
             });
 
-            const bulkDataByMonth = (bulkFtes || []).reduce((acc, fte) => {
+            // Only the selected month. A bulk profile is a monthly artefact, so the month is a
+            // single group and the clients are the bars within it — there is no weekly grain to
+            // break out without inventing one.
+            const bulkClientTotals = (bulkFtes || []).reduce((acc, fte) => {
                 const { allocation_monthyear, bulk_allocation_id, employee_id, employee_name } = fte?.content || {};
                 if (!allocation_monthyear || !bulk_allocation_id) return acc;
-                if (!checkDeptMatch(employee_id, employee_name)) return acc;
+                if (allocation_monthyear !== selectedMonthYear) return acc;
+                if (!matchesTable(employee_id, employee_name)) return acc;
                 
                 const groupCapacity = profileCapacityMap.get(bulk_allocation_id) || 0;
                 if (groupCapacity <= 0) return acc;
@@ -454,75 +485,49 @@ export function DashboardContent() {
                 const baseFte = employee ? (parseFloat(employee.fte || employee.FTE || '0') || 0) : 0;
                 if (!isFinite(baseFte)) return acc;
 
-                if (!acc[allocation_monthyear]) acc[allocation_monthyear] = {};
                 summariesForFte.forEach(summary => {
                     const profileFteAmount = parseFloat(summary?.content?.allocation_percentage || '0') || 0;
                     if (!isFinite(profileFteAmount)) return;
                     const clientName = summary?.content?.cost_center_name || 'Unknown';
                     const share = (profileFteAmount / groupCapacity) * baseFte;
                     if (isFinite(share)) {
-                        acc[allocation_monthyear][clientName] = (acc[allocation_monthyear][clientName] || 0) + share;
+                        acc[clientName] = (acc[clientName] || 0) + share;
                     }
                 });
                 return acc;
-            }, {} as Record<string, Record<string, number>>);
-            initialChartData = Object.entries(bulkDataByMonth).map(([month, clientTotals]) => ({ name: month, ...clientTotals }));
-            title = "Monthly Bulk Allocations";
-            description = "Total FTEs assigned per client via bulk allocation profiles.";
+            }, {} as Record<string, number>);
+            initialChartData = Object.keys(bulkClientTotals).length > 0
+              ? [{ name: monthLabel, ...bulkClientTotals }]
+              : [];
+            title = "Bulk Allocations";
+            description = `Total FTEs assigned per client via bulk allocation profiles in ${monthLabel}.`;
             break;
         }
         case 'freshservice': {
             const freshserviceAllocations = (weeklyAllocations || []).filter(a => {
                 if (!a?.content) return false;
                 const isManual = a.content.cost_center_name === 'MANUAL ENTRY';
-                const matchesDept = checkDeptMatch(a.content.employee_id, a.content.allocation_name);
+                const matchesDept = matchesTable(a.content.employee_id, a.content.allocation_name);
                 return !isManual && matchesDept;
             });
-            const freshserviceDataByMonth = freshserviceAllocations.reduce((acc, alloc) => {
+            // Matched on the calendar month rather than the week keys: the Freshservice and ratio
+            // grids stamp allocation_date as the first of the month, not a Monday.
+            const freshserviceClientTotals = freshserviceAllocations.reduce((acc, alloc) => {
                 const dateStr = alloc?.content?.allocation_date;
-                if (!dateStr) return acc;
-                const dateParts = String(dateStr).split('-');
-                if (dateParts.length !== 3) return acc;
-                const year = dateParts[0];
-                const monthIndex = parseInt(dateParts[1], 10) - 1;
-                if (Number.isNaN(monthIndex) || monthIndex < 0 || monthIndex > 11) return acc;
-                const monthLabel = `${monthsShort[monthIndex]} ${year}`;
+                if (!dateStr || String(dateStr).slice(0, 7) !== selectedYearMonth) return acc;
                 const clientName = alloc?.content?.cost_center_name || 'Unknown';
                 const amount = parseFloat(alloc?.content?.allocation_amount || '0') || 0;
                 if (isFinite(amount)) {
-                    acc[monthLabel] = acc[monthLabel] || {};
-                    acc[monthLabel][clientName] = (acc[monthLabel][clientName] || 0) + amount;
+                    acc[clientName] = (acc[clientName] || 0) + amount;
                 }
                 return acc;
-            }, {} as Record<string, Record<string, number>>);
-             initialChartData = Object.entries(freshserviceDataByMonth).map(([month, totals]) => ({ name: month, ...totals }));
-             title = "Monthly Freshservice Allocations";
-             description = "Total FTEs assigned per client from Freshservice ticket ratios.";
+            }, {} as Record<string, number>);
+             initialChartData = Object.keys(freshserviceClientTotals).length > 0
+               ? [{ name: monthLabel, ...freshserviceClientTotals }]
+               : [];
+             title = "Freshservice Allocations";
+             description = `Total FTEs assigned per client from Freshservice ticket ratios in ${monthLabel}.`;
              break;
-        }
-        case 'targets': {
-            const targetsByQuarter = (targets || []).reduce((acc, target) => {
-                const content = target?.content;
-                if (!content) return acc;
-                const dateStr = content.targets_allocation_date;
-                if (!dateStr) return acc;
-                if (!checkDeptMatch(undefined, content.targets_allocation_name)) return acc;
-                const date = parseISO(dateStr);
-                if (!isValid(date)) return acc;
-                const quarter = `Q${Math.floor(date.getUTCMonth() / 3) + 1} ${date.getUTCFullYear()}`;
-                const clientName = content.targets_cost_center_name || 'Unknown';
-                const amount = parseFloat(content.targets_allocation_amount || '0') || 0;
-                
-                if (isFinite(amount)) {
-                    if (!acc[quarter]) acc[quarter] = {};
-                    acc[quarter][clientName] = (acc[quarter][clientName] || 0) + amount;
-                }
-                return acc;
-            }, {} as Record<string, Record<string, number>>);
-            initialChartData = Object.entries(targetsByQuarter).map(([quarter, totals]) => ({ name: quarter, ...totals }));
-            title = "Quarterly Hiring Targets";
-            description = "Total hires targeted per client, grouped by quarter.";
-            break;
         }
         case 'total':
         case 'weekly':
@@ -534,13 +539,13 @@ export function DashboardContent() {
             // the chart beside it covers exactly the same weeks. Total stays a rolling trend — that
             // view exists to show movement over time, which one month cannot.
             const lastPeriod = isTotal
-              ? Array.from({ length: weeksCount }, (_, i) => startOfWeek(subWeeks(today, (weeksCount - 1) - i), { weekStartsOn: 1 }))
-              : (getWeeksForMonth(today) || []).map(w => startOfWeek(w.startDate, { weekStartsOn: 1 }));
+              ? Array.from({ length: weeksCount }, (_, i) => startOfWeek(subWeeks(selectedDate, (weeksCount - 1) - i), { weekStartsOn: 1 }))
+              : monthWeekKeysFor(selectedDate).map(k => startOfWeek(parseISO(k), { weekStartsOn: 1 }));
             initialChartData = lastPeriod.map(weekStart => {
               const weekKey = format(weekStart, 'yyyy-MM-dd');
               const allocationsForWeek = (weeklyAllocations || []).filter(a => {
                   if (!a?.content || a.content.allocation_date !== weekKey) return false;
-                  return checkDeptMatch(a.content.employee_id, a.content.allocation_name);
+                  return matchesTable(a.content.employee_id, a.content.allocation_name);
               });
               const weeklyTotals = allocationsForWeek.reduce((acc, curr) => {
                 const clientName = curr?.content?.cost_center_name || 'Unknown';
@@ -556,8 +561,8 @@ export function DashboardContent() {
             });
             title = isTotal ? "Total FTE Allocation Trend" : "Weekly Client Allocation";
             description = isTotal
-              ? "FTEs allocated per client (Weekly) over the last 8 weeks."
-              : `Total FTEs allocated per client, by week of ${format(today, 'MMMM yyyy')}.`;
+              ? `FTEs allocated per client over the 8 weeks up to ${monthLabel}.`
+              : `Total FTEs allocated per client, by week of ${monthLabel}.`;
             break;
         }
     }
@@ -569,7 +574,7 @@ export function DashboardContent() {
           }) : initialChartData;
 
     return { chartData: finalChartData, chartTitle: title, chartDescription: description };
-  }, [today, hasMounted, loading, chartView, weeklyAllocations, bulkFtes, bulkSummaries, targets, chartClientFilter, chartDepartmentFilter, allEmployees]);
+  }, [selectedDate, hasMounted, loading, chartView, weeklyAllocations, bulkFtes, bulkSummaries, chartClientFilter, allEmployees, tableEmployeeIds]);
 
   const detailState = useMemo(() => {
     if (!hasMounted) return { title: 'FTE List', data: [], description: 'Loading...' };
@@ -592,10 +597,12 @@ export function DashboardContent() {
   const handleCardClick = (view: ActiveView) => setActiveView(current => (current === view ? null : view));
   const handleEmployeeFilterChange = (filterName: keyof typeof employeeFilters, value: string) => setEmployeeFilters(prev => { const current = prev[filterName] || []; const next = current.includes(value) ? current.filter(v => v !== value) : [...current, value]; return { ...prev, [filterName]: next }; });
   const handleChartClientFilterChange = (value: string) => setChartClientFilter(prev => { const current = prev || []; return current.includes(value) ? current.filter(v => v !== value) : [...current, value]; });
-  const handleChartDepartmentFilterChange = (value: string) => setChartDepartmentFilter(prev => { const current = prev || []; return current.includes(value) ? current.filter(v => v !== value) : [...current, value]; });
   const clearEmployeeFilters = () => setEmployeeFilters({ fullName: [], title: [], manager: [], department: [] });
-  const clearChartFilters = () => { setChartClientFilter([]); setChartDepartmentFilter([]); };
-  const isPageLoading = loading || !today || !hasMounted;
+  const clearChartFilters = () => { setChartClientFilter([]); };
+
+  const handlePrevMonth = () => setSelectedDate(prev => (prev ? subMonths(prev, 1) : prev));
+  const handleNextMonth = () => setSelectedDate(prev => (prev ? addMonths(prev, 1) : prev));
+  const isPageLoading = loading || !today || !selectedDate || !hasMounted;
 
   const totalFteVal = isPageLoading ? 0 : (parseFloat(stats.totalFtes.toString()) || 0);
   const allocatedFteVal = isPageLoading ? 0 : (parseFloat(stats.allocatedFtes.toString()) || 0);
@@ -604,6 +611,17 @@ export function DashboardContent() {
   return (
     <div className="flex flex-col gap-8">
       <PageHeader title="Dashboard" />
+      <div className="flex items-center justify-center gap-2">
+        <Button variant="outline" size="icon" onClick={handlePrevMonth} disabled={isPageLoading}>
+          <ChevronLeft className="h-4 w-4" />
+        </Button>
+        <span className="text-sm font-medium w-40 text-center">
+          {isPageLoading || !selectedDate ? <Skeleton className="h-5 w-32 mx-auto" /> : format(selectedDate, 'MMMM yyyy')}
+        </span>
+        <Button variant="outline" size="icon" onClick={handleNextMonth} disabled={isPageLoading}>
+          <ChevronRight className="h-4 w-4" />
+        </Button>
+      </div>
       <div className="grid gap-4 md:grid-cols-3">
         <SummaryCard title="Total FTEs" value={isPageLoading ? <Skeleton className="h-8 w-1/2" /> : (Number.isNaN(totalFteVal) ? '0.00' : totalFteVal.toFixed(2))} icon={Users} onClick={() => handleCardClick('total')} isActive={activeView === 'total'} />
         <SummaryCard title="Allocated FTEs" value={isPageLoading ? <Skeleton className="h-8 w-1/2" /> : (Number.isNaN(allocatedFteVal) ? '0.00' : allocatedFteVal.toFixed(2))} icon={Briefcase} onClick={() => handleCardClick('allocated')} isActive={activeView === 'allocated'} />
@@ -618,20 +636,21 @@ export function DashboardContent() {
                   <CardDescription>{isPageLoading ? <Skeleton className="h-4 w-full" /> : chartState.chartDescription}</CardDescription>
                 </div>
                 <Tabs value={chartView} onValueChange={(v) => setChartView(v as any)} className="w-full sm:w-auto">
-                    <TabsList className="grid w-full grid-cols-2 sm:grid-cols-5 h-auto sm:h-10">
+                    <TabsList className="grid w-full grid-cols-2 sm:grid-cols-4 h-auto sm:h-10">
                         <TabsTrigger value="weekly">Weekly</TabsTrigger>
                         <TabsTrigger value="bulk">Bulk</TabsTrigger>
                         <TabsTrigger value="freshservice">Freshservice</TabsTrigger>
-                        <TabsTrigger value="targets">Targets</TabsTrigger>
                         <TabsTrigger value="total">Total</TabsTrigger>
                     </TabsList>
                 </Tabs>
               </div>
-               <div className="grid grid-cols-1 md:grid-cols-3 gap-2 pt-4">
+               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-4">
                   <MultiSelectFilter placeholder="Filter by Client..." options={allChartClients} selected={chartClientFilter} onValueChange={handleChartClientFilterChange} disabled={isPageLoading} />
-                  <MultiSelectFilter placeholder="Filter by Department..." options={allChartDepartments} selected={chartDepartmentFilter} onValueChange={handleChartDepartmentFilterChange} disabled={isPageLoading} />
-                  <Button variant="outline" onClick={clearChartFilters} disabled={isPageLoading || (chartClientFilter.length === 0 && chartDepartmentFilter.length === 0)}>Clear Chart Filters</Button>
+                  <Button variant="outline" onClick={clearChartFilters} disabled={isPageLoading || chartClientFilter.length === 0}>Clear Client Filter</Button>
               </div>
+              <p className="text-xs text-muted-foreground pt-2">
+                Showing the employees listed in the table — use its filters, and the cards above, to narrow both.
+              </p>
             </CardHeader>
             <CardContent>{isPageLoading ? <Skeleton className="h-[400px] w-full" /> : <FteAllocationChart data={chartState.chartData} />}</CardContent>
           </Card>
