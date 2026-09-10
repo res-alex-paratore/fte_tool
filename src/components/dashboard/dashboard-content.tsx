@@ -217,6 +217,40 @@ export function DashboardContent() {
     fetchData();
   }, []);
 
+  /**
+   * One document per person, week and client — the newest.
+   *
+   * AppDB keeps every version of an edited allocation. Before 0.0.48 a second save re-POSTed
+   * rather than updating, so the same person/week/client can hold several documents. The grid
+   * hides them (hydrateCells keys weeklyFtes by date, so the last one silently overwrites the
+   * rest and the row reads 1.00), but summing them doubled the dashboard — the 2.00 shown for
+   * people the grid displays as 1.00.
+   *
+   * This is the same de-duplication the reporting dataflow applies as rank = 1: partitioned on
+   * (allocation_date, allocation_name, cost_center_name), ordered __created__ DESC. Keying on the
+   * cost centre *name* rather than the number also collapses documents that differ only by an
+   * untrimmed number, which the grid likewise groups into one row.
+   */
+  const dedupedWeeklyAllocations = useMemo(() => {
+    const docTime = (a: any): number => {
+      const raw = a?.__created__ ?? a?.createdOn ?? a?.createdAt ?? a?.__modified__ ?? a?.updatedOn;
+      const t = raw ? new Date(raw).getTime() : NaN;
+      return Number.isFinite(t) ? t : -1;
+    };
+
+    const newestByKey = new Map<string, WeeklyAllocation>();
+    (weeklyAllocations || []).forEach(a => {
+      const c = a?.content;
+      if (!c) return;
+      const key = [c.allocation_date, c.allocation_name, String(c.cost_center_name || '').trim()].join('|');
+      const existing = newestByKey.get(key);
+      // With no timestamp on the document this falls back to array order, where the later entry is
+      // the more recent write.
+      if (!existing || docTime(a) >= docTime(existing)) newestByKey.set(key, a);
+    });
+    return Array.from(newestByKey.values());
+  }, [weeklyAllocations]);
+
   const filteredEmployeesBase = useMemo(() => {
     if (!hasMounted) return [];
     return (allEmployees || [])
@@ -252,7 +286,7 @@ export function DashboardContent() {
     // Both this table and the Weekly chart are framed on the current fiscal month, taken from the
     // same calendar helper the allocation grid uses so the weeks line up with what managers edit.
     const monthWeekKeys = new Set(monthWeekKeysFor(selectedDate));
-    const monthAllocations = (weeklyAllocations || []).filter(a => a?.content?.allocation_date && monthWeekKeys.has(a.content.allocation_date));
+    const monthAllocations = dedupedWeeklyAllocations.filter(a => a?.content?.allocation_date && monthWeekKeys.has(a.content.allocation_date));
 
     const currentMonthYear = formatAllocationMonthYear(selectedDate);
 
@@ -376,7 +410,7 @@ export function DashboardContent() {
       unallocatedEmployees: unallocatedEmps,
       allocatedFteMap
     };
-  }, [selectedDate, hasMounted, loading, filteredEmployeesBase, weeklyAllocations, bulkFtes, bulkSummaries, allEmployees]);
+  }, [selectedDate, hasMounted, loading, filteredEmployeesBase, dedupedWeeklyAllocations, bulkFtes, bulkSummaries, allEmployees]);
 
   // The chart shows only the employees the table is showing, so the employee filters and the
   // selected tile drive both halves of the page from one place.
@@ -412,13 +446,13 @@ export function DashboardContent() {
   const allChartClients = useMemo<string[]>(() => {
     if (loading || !hasMounted) return [];
     const clientsSet = new Set<string>();
-    (weeklyAllocations || []).forEach(a => { if (a?.content?.cost_center_name) clientsSet.add(String(a.content.cost_center_name)); });
+    dedupedWeeklyAllocations.forEach(a => { if (a?.content?.cost_center_name) clientsSet.add(String(a.content.cost_center_name)); });
     (bulkSummaries || []).forEach(s => { if (s?.content?.cost_center_name) clientsSet.add(String(s.content.cost_center_name)); });
 
     return Array.from(clientsSet)
       .filter(c => typeof c === 'string' && c)
       .sort((a,b) => a.localeCompare(b));
-  }, [loading, hasMounted, weeklyAllocations, bulkSummaries]);
+  }, [loading, hasMounted, dedupedWeeklyAllocations, bulkSummaries]);
 
   const chartState = useMemo(() => {
     if (!selectedDate || !hasMounted || loading) {
@@ -504,7 +538,7 @@ export function DashboardContent() {
             break;
         }
         case 'freshservice': {
-            const freshserviceAllocations = (weeklyAllocations || []).filter(a => {
+            const freshserviceAllocations = dedupedWeeklyAllocations.filter(a => {
                 if (!a?.content) return false;
                 const isManual = a.content.cost_center_name === 'MANUAL ENTRY';
                 const matchesDept = matchesTable(a.content.employee_id, a.content.allocation_name);
@@ -531,14 +565,14 @@ export function DashboardContent() {
         }
         case 'weekly':
         default: {
-            const allWeeklyClients = Array.from(new Set((weeklyAllocations || []).map(a => String(a?.content?.cost_center_name)).filter(c => c && c !== 'undefined')));
+            const allWeeklyClients = Array.from(new Set(dedupedWeeklyAllocations.map(a => String(a?.content?.cost_center_name)).filter(c => c && c !== 'undefined')));
             // Weekly is framed on the current fiscal month, from the same helper the table uses, so
             // the chart beside it covers exactly the same weeks. Total stays a rolling trend — that
             // view exists to show movement over time, which one month cannot.
             const lastPeriod = monthWeekKeysFor(selectedDate).map(k => startOfWeek(parseISO(k), { weekStartsOn: 1 }));
             initialChartData = lastPeriod.map(weekStart => {
               const weekKey = format(weekStart, 'yyyy-MM-dd');
-              const allocationsForWeek = (weeklyAllocations || []).filter(a => {
+              const allocationsForWeek = dedupedWeeklyAllocations.filter(a => {
                   if (!a?.content || a.content.allocation_date !== weekKey) return false;
                   return matchesTable(a.content.employee_id, a.content.allocation_name);
               });
@@ -567,7 +601,7 @@ export function DashboardContent() {
           }) : initialChartData;
 
     return { chartData: finalChartData, chartTitle: title, chartDescription: description };
-  }, [selectedDate, hasMounted, loading, chartView, weeklyAllocations, bulkFtes, bulkSummaries, chartClientFilter, allEmployees, tableEmployeeIds]);
+  }, [selectedDate, hasMounted, loading, chartView, dedupedWeeklyAllocations, bulkFtes, bulkSummaries, chartClientFilter, allEmployees, tableEmployeeIds]);
 
   const detailState = useMemo(() => {
     if (!hasMounted) return { title: 'FTE List', data: [], description: 'Loading...' };
