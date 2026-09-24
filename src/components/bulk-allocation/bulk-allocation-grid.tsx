@@ -432,8 +432,8 @@ export function BulkAllocationGrid({ onSaveSuccess, templateToCopy }: BulkAlloca
       toast({ variant: 'destructive', title: 'No employees selected.' });
       return;
     }
-    if (Math.abs(totalAllocatedFte - totalSelectedFte) > 0.01) {
-      toast({ variant: 'destructive', title: 'Allocation Mismatch', description: `Total allocated FTE (${totalAllocatedFte.toFixed(2)}) must match the selected employees' total FTE (${totalSelectedFte.toFixed(2)}).` });
+    if (totalSelectedFte - totalAllocatedFte > 0.01) {
+      toast({ variant: 'destructive', title: 'Allocation Mismatch', description: `Total allocated FTE (${totalAllocatedFte.toFixed(2)}) must be at least the selected employees' total FTE (${totalSelectedFte.toFixed(2)}).` });
       return;
     }
     if (allocationRows.some(row => !row.clientName || row.fte < 0)) {
@@ -525,7 +525,7 @@ export function BulkAllocationGrid({ onSaveSuccess, templateToCopy }: BulkAlloca
   };
   
   const isPageLoading = loading || userLoading || !hasMounted;
-  const isAllocationInvalid = Math.abs(totalAllocatedFte - totalSelectedFte) > 0.01;
+  const isAllocationInvalid = totalSelectedFte - totalAllocatedFte > 0.01;
   const isSubmitDisabled = isPageLoading || isSubmitting || selectedEmployees.size === 0 || isAllocationInvalid || !selectedAllocationGroup || (selectedAllocationGroup === 'Other' && !otherAllocationGroup.trim());
 
   return (
@@ -731,7 +731,7 @@ export function BulkAllocationGrid({ onSaveSuccess, templateToCopy }: BulkAlloca
               <Alert variant={isAllocationInvalid ? 'destructive' : 'default'}>
                 <AlertDescription>
                   Total Allocated: <span className="font-bold">{(parseFloat(totalAllocatedFte.toString()) || 0).toFixed(2)}</span> / {(parseFloat(totalSelectedFte.toString()) || 0).toFixed(2)} FTE
-                  {isAllocationInvalid && " (Totals must match)"}
+                  {isAllocationInvalid && " (Allocated total must be at least the selected FTE total)"}
                 </AlertDescription>
               </Alert>
             </div>
