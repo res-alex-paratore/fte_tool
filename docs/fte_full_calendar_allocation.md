@@ -3,6 +3,8 @@
 Reference for the Domo Magic ETL that produces the reporting dataset
 `fte_full_calendar_allocation` (dataset guid `0ce8e039-d17a-4af9-911d-6d96ff6f7e2e`).
 
+Last checked against a dataflow export on 2026-10-08.
+
 The same dataflow publishes two other datasets from partly shared tiles:
 
 | Output | Fed by | Grain |
@@ -26,13 +28,15 @@ Three independent things agree on that Monday, which is why the flow works:
    (`startOfWeek(reportingWeekDate, {weekStartsOn: 1})` in
    [`multi-week-grid.tsx:38`](../src/components/allocation/multi-week-grid.tsx#L38)),
    even though the grid *displays* the Sunday week-ending date to users.
-2. **The bulk branch** explodes each monthly profile onto the Mondays of that fiscal month
-   (`Filter Rows` → `Day of Week = 'Monday'`).
+2. **The bulk branch** explodes each monthly profile onto calendar Mondays
+   (`Filter Rows` → `Day of Week = 'Monday'`), choosing them by the Gregorian month of each
+   week's Friday (§2.4).
 3. **The skeleton** is built from the same Monday rows (`Filter Rows 3`).
 
 So a user who sees `W/E Aug 2` in the tool is editing the row whose `Day` is `2026-07-27`.
-That six-day gap is *by design* and is resolved correctly, because fiscal month attribution
-is **looked up from the calendar**, never derived by date arithmetic — see §3.
+That six-day gap is *by design*. The fiscal columns are **looked up from the calendar**; the
+Gregorian month that the bulk explosion and `month_greg` use is **derived** as Monday + 4 days,
+i.e. the Friday — see §3.
 
 ---
 
@@ -43,11 +47,11 @@ is **looked up from the calendar**, never derived by date arithmetic — see §3
 | Tile | Dataset | Notes |
 |---|---|---|
 | `weekly_allocation_..._APP_DB` | AppDB collection written by the Weekly Allocation grid | `allocation_amount` force-cast to DOUBLE at load |
-| `consolidated_hr_fte_report_view` | HR roster | supplies `fte`, `department`, `manager`, `region`, `opco`, `person_id` |
+| `consolidated_hr_fte_report_view` | HR roster (a view, `6f93982e-…`, over `consolidated_hr_fte_report`) | supplies `fte`, `department`, `manager`, `region`, `opco`, `person_id`, `start_date`, `end_date` |
 | `bulk_allocation_fte_..._APP_DB` | bulk profile → employee membership | carries `allocation_monthyear` |
 | `bulk_allocation_summary_..._APP_DB` | bulk profile → cost-centre split | carries `allocation_percentage`, `allocation_group` |
 | `mst_blue_global_calendar_445` | master 4-4-5 calendar, **daily grain** | the only source of fiscal truth |
-| `gbs_cost_center_guidance_consolidated` | cost-centre reference | joined on `AI level name` |
+| `fte_cost_center_sheet` | cost-centre reference | joined on `AI level name`; supplies `Account Region`, `P&L country`, `service type`, `Opco Tagetik`, `Invoiced entity`, `cost center code report` |
 | `weekly_targets_..._APP_DB` | quarterly targets | feeds `fte_targets` only |
 | `fte_full_calendar_allocation_input` | **this flow's own previous output** | see §5 |
 
@@ -58,10 +62,16 @@ consolidated_hr_fte_report_view
   → Rank & Window 1   RANK() over person_id ORDER BY start_date DESC  → row_rank
   → Filter Rows 2     row_rank = 1                                    (latest record per person)
   → Select Columns    full_name, department, region, fte, manager, manager_email,
-                      country→fte_country, person_email, opco, person_id, missing_flag
+                      country→fte_country, person_email, opco, person_id, missing_flag,
+                      status, start_date, end_date
   → Select Columns 6  (skeleton subset: full_name, fte, person_id, department,
-                       manager, manager_email, fte_country, missing_flag)
+                       manager, manager_email, fte_country, missing_flag,
+                       status, start_date, end_date)
 ```
+
+Anyone missing from the HR roster is missing from the skeleton, and so from this dataset entirely —
+including any allocations already logged for them (§2.5). The HR flow drops people with a **null**
+manager; see [`DASHBOARD_HANDOVER.md` §4.1](DASHBOARD_HANDOVER.md#41-consolidated_hr_fte_report-magic-etl).
 
 ### 2.3 Weekly branch
 
@@ -76,13 +86,14 @@ weekly_allocation
   → Rank & Window     partition (allocation_date, allocation_name, cost_center_name, allocation_type)
                       order __created__ DESC
                         rank                = RANK()
-                        previous_fte_value  = LEAD(allocation_amount, 1)
   → Add Formula 2     fte = IFNULL(fte, 1.0)
                       department = weekly ? fte_department : department
-  → Alter Columns     fte → DOUBLE
+                      previous_fte_value = baseline_fte_value   (written by the app, §6.4 of the handover)
+  → Alter Columns     fte, baseline_fte_value → DOUBLE
   → Join Data 4       LEFT OUTER to cost-centre guidance on cost_center_name = "AI level name"
                       ├── publishes fte_weekly_allocation
-  → Group By 2        SUM(allocation_amount) grouped by ~29 descriptive columns
+  → Group By 2        SUM(allocation_amount) grouped by ~30 descriptive columns
+                      (incl. person_id, rank, correction_month, previous_fte_value)
   → Join Data 7
 ```
 
@@ -96,7 +107,12 @@ bulk_allocation_fte ⨝ bulk_allocation_summary   (INNER on bulk_allocation_id)
   → Group By 1        employee_count = COUNT(DISTINCT employee_name) per bulk_allocation_id
   → Join Data 5       attach employee_count
   → Join Data 2       INNER to calendar Mondays on allocation_monthyear = monthyear
-                      ── this is the explosion: one row per Monday of that fiscal month
+                      calendar side: Filter Rows (Day of Week = 'Monday',
+                                                  Calendar Reporting Year >= 2024)
+                                     → Add Formula 3 monthyear =
+                                         DATE_FORMAT(DATE_ADD(Day, INTERVAL 4 DAY), '%b %Y')
+                      ── this is the explosion: one row per Monday whose Friday falls in that
+                         Gregorian month
   → Group By          num_weeks = COUNT(DISTINCT Day) per (allocation_monthyear, bulk_allocation_id)
   → Join Data 3       attach num_weeks
   → Select Columns 1  Day → allocation_date, allocation_group → department,
@@ -105,7 +121,7 @@ bulk_allocation_fte ⨝ bulk_allocation_summary   (INNER on bulk_allocation_id)
                       allocation_amount = allocation_amount / num_weeks / employee_count
 ```
 
-So a profile holding 3.0 FTE for a client, covering 6 people, in a 4-week fiscal month,
+So a profile holding 3.0 FTE for a client, covering 6 people, in a 4-week month,
 yields `3.0 / 4 / 6 = 0.125` on each of the 4 Mondays for each of the 6 people.
 
 ### 2.5 The skeleton — why it is called "full calendar"
@@ -116,12 +132,19 @@ mst_blue_global_calendar_445
                       Reporting Month Date, Reporting Week Date
   → Filter Rows 3     Day of Week = 'Monday'
                       AND Calendar Reporting Year >= 2026
-                      AND Calendar Reporting Year <= YEAR(CURRENT_DATE() + 1)
+                      AND Calendar Reporting Year <= YEAR(CURRENT_DATE()) + 1
   → Add Formula 6     skeleton_cost_center = 'Unassigned', skeleton_amount = 0
 
 Select Columns 6 (roster)  ⨯  the above     ← Join Data 6 is a CROSS JOIN
   = every employee × every in-window Monday
+  → Filter Rows 5     (start_date IS NULL OR Day >= start_date)
+                      AND (end_date IS NULL OR Day <= end_date)
+  = every employee × every Monday they were employed, within the window
 ```
+
+`Filter Rows 5` trims weeks before a person started and after they left. For anyone with no
+`end_date` — i.e. everyone currently active — the skeleton still runs to the end of next year, so
+**future weeks are published** (relevant to §5).
 
 That cross join is what guarantees a row exists for a person-week even when nobody logged
 anything — which is what makes `'No Logs Entered'` reporting possible.
@@ -130,6 +153,8 @@ anything — which is what makes `'No Logs Entered'` reporting possible.
   → Join Data 7       LEFT OUTER skeleton ⨝ Group By 2
                       ON (full_name, person_id, Day) = (allocation_name, person_id, allocation_date)
                       skeleton's department is renamed placeholder_department
+                      allocation side's person_id, manager, manager_email, fte_country
+                      are dropped — those always come from the HR roster
 ```
 
 > **The skeleton is person-week grain, not person-cost-centre-week.** `cost_center_name` is not in
@@ -244,12 +269,16 @@ flow publishes to.
 fte_full_calendar_allocation_input
   → Select Columns 9   manager→historical_manager, department→historical_department,
                        manager_email→historical_manager_email, person_id, Day
-  → Remove Duplicates  on (person_id, Day)
+  → Remove Duplicates  on the subset (person_id, Day)
   → Join Data 11       LEFT OUTER on (person_id, Day)
-  → Add Formula 9      department    = COALESCE(historical_department,    department)
-                       manager       = COALESCE(historical_manager,       manager)
-                       manager_email = COALESCE(historical_manager_email, manager_email)
+  → Group By 3         distinct_cc_count = COUNT(DISTINCT cost_center_name) per (person_id, Day)
+  → Join Data 12       LEFT OUTER, attaches distinct_cc_count
+  → Add Formula 9      department    = bulk ? department
+                                            : frozen value only for past weeks (see below)
+                       manager       = frozen value only for past weeks with a real manager
+                       manager_email = same condition as manager
                        last_updated  = DATE_FORMAT(CURRENT_TIMESTAMP(), '%d/%m/%Y %h:%i %p')
+                       assigned_fte  = fte / NULLIF(distinct_cc_count, 0)
   → Alter Columns 3    drop the three historical_* helper columns
   → PublishToVault     fte_full_calendar_allocation (REPLACE)
 ```
@@ -257,10 +286,48 @@ fte_full_calendar_allocation_input
 **Intent:** freeze the org structure as it was when a week was first reported, so a reorg does
 not retroactively restate history. Manager and department for a past week stay as they were.
 
+**Current rules (live in sandbox and PROD since 2026-10-12).** A week takes its frozen value only if
+the week has started (`Day <= CURRENT_DATE()`) and the frozen value is real. Otherwise it takes
+current HR:
+
+```sql
+-- department (non-bulk rows)
+CASE
+  WHEN `allocation_type` = 'bulk' THEN `department`
+  WHEN `Day` > CURRENT_DATE()
+    OR `historical_department` IS NULL
+    OR TRIM(`historical_department`) = ''
+  THEN `department`
+  ELSE `historical_department`
+END
+
+-- manager; manager_email uses the same WHEN, returning manager_email / historical_manager_email
+CASE
+  WHEN `Day` > CURRENT_DATE()
+    OR `historical_manager` IS NULL
+    OR TRIM(`historical_manager`) = ''
+    OR `historical_manager` = 'No manager assigned'
+  THEN `manager`
+  ELSE `historical_manager`
+END
+```
+
+Before this, all three were plain `COALESCE(historical_x, x)`. Every week out to the end of next
+year is published as soon as a person joins the roster, so the first value was frozen into future
+weeks too and no HR change ever reached reporting. Weeks published before 2026-10-12 still carry
+whatever was frozen then; only future weeks have been corrected.
+Bulk rows are exempt from the department freeze: their `department` is the bulk
+`allocation_group` (§2.4) and always comes from the current run.
+
+`assigned_fte` is the person's FTE divided by the number of cost centres they have that week, so
+it sums back to `fte` across a person-week. It is the row-level equivalent of the `fte2` Beast Mode.
+
 **How it behaves across runs:**
 
 - Run 1 (empty output): all `historical_*` are NULL → everything falls back to current HR.
 - Run N: any (person_id, Day) that already exists keeps its **first-ever** published values.
+- Future weeks are never frozen (see the rules above), so "first-ever" now means the first run on
+  or after that Monday.
 
 Consequences to keep in mind when troubleshooting — see §6.
 
@@ -322,30 +389,52 @@ re-run; correcting it requires clearing the input dataset or a one-off run with 
 Test structural changes against a scratch output dataset before publishing to `0ce8e039-…`.
 
 Compounding this: which row survives `Remove Duplicates` on `(person_id, Day)` is not deterministic.
-Where a person-week carries heterogeneous `department` values — which happens whenever bulk rows
-(whose `department` holds the bulk `allocation_group`, §2.4) sit alongside weekly rows — the frozen
-value is effectively arbitrary.
+Bulk rows no longer take a frozen department, but the lookup is still built from *all* rows of the
+previous output, bulk included. Where a person-week has bulk rows alongside weekly or placeholder
+rows, the department frozen onto the non-bulk rows can be a bulk `allocation_group` label.
 
-> **Unverified:** whether `Remove Duplicates` is configured on the subset `(person_id, Day)` or on
-> *all columns*. If all columns, a person-week with two different `department` values yields two
-> lookup rows and `Join Data 11` **multiplies the dataset**. Worth confirming.
+`Remove Duplicates` is confirmed to be keyed on the subset `(person_id, Day)`, so `Join Data 11`
+cannot fan out.
 
-### 6.4 The bulk explosion axis is contradicted by two sources
+### 6.3a Blank and future values were frozen too (fixed 2026-10-12)
 
-[`fiscal-calendar.ts:18`](../src/lib/fiscal-calendar.ts#L18) states the dataflow matches
-`allocation_monthyear` against `DATE_FORMAT(<the week's Friday>, '%b %Y')` — Gregorian. §2.4 of this
-doc describes `Join Data 2` as landing on the Mondays of that **fiscal** month. Both are prose; neither
-is the tile. A third possibility is that `monthyear` is the *Monday's* Gregorian month.
+Two consequences of §6.3 hit manager and department until 2026-10-12:
 
-It matters: Gregorian Aug 2026 is Mondays `{08-03, 08-10, 08-17, 08-24}`; fiscal Aug 2026 is
-`{07-27, 08-03, 08-10, 08-17}`. Open `Join Data 2` and settle it, then correct whichever source is
-wrong. Until then, treat any statement about which weeks a bulk profile lands on as unconfirmed.
+- **`COALESCE` only skips NULL**, so empty-string managers were frozen like real names.
+- **Future weeks were frozen on first publish**, so a manager or department change in HR never
+  reached reporting. Example: a person moved from Business Services RPO to MSP on 2026-08-10. HR
+  and `fte_weekly_allocation` showed MSP, while every row in this dataset, 2027 included, still
+  showed RPO.
 
-Query 7.4 answers it from the data without opening the tile. Note that this does **not** gate the
-densification in [`domo_sql/`](domo_sql/README.md) — the cards report Gregorian months, so
-densifying on the Gregorian axis is self-consistent either way. If the explosion turns out to be
-fiscal, bulk per-month averages will visibly drop once densified; that is this mismatch surfacing,
-and the pre-densification figures are wrong in the other direction.
+The rules in §5 fix both going forward. Past weeks frozen with a stale or blank value stay as they
+are. To restate one person, add a temporary line to the `department` (or manager) expression, run
+once, then remove it:
+
+```sql
+WHEN `person_id` = '<id>' AND `Day` >= '<Monday the change took effect>' THEN `department`
+```
+
+**Future: effective dates.** The example above could only be fixed going forward, because nothing
+in the data says the move took effect on 2026-08-10; HR shows the new department, and
+`hr_roster_history` only records when the change was noticed. If an effective-date field becomes
+available from an HR source, past weeks can be restated automatically: join effective-dated changes
+on person and `Day >= effective_date`, which is the one-off line above, generalised. The same dates
+could become real `valid_from` values in `hr_roster_history`.
+
+**Do not filter bulk rows out of the history lookup** to stop bulk group labels being frozen as a
+department. The same lookup freezes manager, and bulk-only person-weeks have no other rows, so their
+past managers would be rewritten from current HR. Keeping bulk labels out of the department lookup
+would need a Group By that picks department from non-bulk rows and manager from all rows.
+
+### 6.4 The bulk explosion is on the Gregorian axis (resolved)
+
+The export settles it: `Add Formula 3` computes
+`monthyear = DATE_FORMAT(DATE_ADD(Day, INTERVAL 4 DAY), '%b %Y')`, the Gregorian month of the
+week's **Friday**, matching [`fiscal-calendar.ts:18`](../src/lib/fiscal-calendar.ts#L18). So Aug 2026
+lands on Mondays `{08-03, 08-10, 08-17, 08-24}`, not the fiscal `{07-27, 08-03, 08-10, 08-17}`.
+
+Bulk rows are therefore dense on `month_greg` and not on the fiscal columns — which is what the
+`nam fte reporting` dashboard (fiscal axis) sees at month boundaries.
 
 ### 6.5 The `INTERVAL 4 DAY` offset lives in two places with nothing enforcing agreement
 
@@ -421,7 +510,7 @@ FROM fte_full_calendar_allocation WHERE `rank` = 1
 GROUP BY 1,2,3,4 HAVING d > 1 OR n > 1 OR f > 1 OR mg > 1;
 ```
 
-### 7.4 Which weeks do bulk rows actually land on (settles §6.4)
+### 7.4 Which weeks do bulk rows actually land on (confirms §6.4)
 
 ```sql
 SELECT month_greg, COUNT(DISTINCT `Day`) AS bulk_mondays, MIN(`Day`) AS first_monday
@@ -429,7 +518,8 @@ FROM fte_full_calendar_allocation
 WHERE `rank` = 1 AND allocation_type = 'bulk' GROUP BY 1 ORDER BY 1;
 ```
 
-A `first_monday` one week earlier than the month's own first Monday means the explosion is fiscal.
+Each `first_monday` should be the first Monday whose Friday falls in that month. One a week earlier
+would mean the explosion had been changed to fiscal.
 
 ### 7.5 Cost-centre name variants (settles §6.6)
 
