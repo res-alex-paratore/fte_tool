@@ -3,7 +3,8 @@
 Everything needed to take over the FTE reporting dashboards in Domo: what feeds them, what each
 card computes, what is known to be wrong, and what breaks what.
 
-**Compiled** 2026-08-13 from live exports of the dataflows and dashboard pages.
+**Compiled** 2026-08-13 from live exports of the dataflows and dashboard pages. §4.1 and §4.2
+re-checked against fresh dataflow exports on 2026-10-08.
 **Outgoing owner:** Alex Paratore. **Content owner group:** `content owner - GBS FTE tool`.
 
 > **Read §1 before anything else.** There are two Domo environments running the same dashboard
@@ -72,14 +73,16 @@ flowchart TD
     DF["dayforce_emea_can_hr_data"]
     WD["workday_ind_hr_data"]
     GCP["NAM HRIS Levels GCP"]
-    MX["gbs_fte_mexico"]
+    MX["gbs_fte_mexico_report_feed"]
   end
 
   CAL["mst_blue_global_calendar_445<br/>(4-4-5 calendar, daily)"]
-  CC["gbs_cost_center_guidance_consolidated"]
+  CC["fte_cost_center_sheet"]
 
   PS & DF & WD & GCP & MX --> HRETL["ETL: consolidated_hr_fte_report"]
   HRETL --> HRDS["consolidated_hr_fte_report"]
+  HRETL --> HRNF["fte_hr_no_filter"]
+  HRETL --> HRDQ["hr_data_quality"]
 
   WA & BA & WT --> MAIN["ETL: fte_full_calendar_allocation"]
   HRDS --> MAIN
@@ -104,7 +107,7 @@ flowchart TD
   V4 & V2 --> D2["Dashboard: nam fte reporting"]
 ```
 
-Three dataflows, four published datasets, four views, two dashboards, 29 cards.
+Three dataflows, seven published datasets, four views, two dashboards, 29 cards.
 
 ---
 
@@ -139,7 +142,17 @@ Behaviour that matters downstream:
 
 ### 4.1 `consolidated_hr_fte_report` (Magic ETL)
 
-Publishes `consolidated_hr_fte_report` → `6d199fbe-6a26-479f-8a0f-aae022372648`, **REPLACE**.
+Publishes three datasets, all **REPLACE**:
+
+| Output | GUID | Fed by | Contents |
+|---|---|---|---|
+| **`consolidated_hr_fte_report`** | `6d199fbe-6a26-479f-8a0f-aae022372648` | `Remove Duplicates` | the cleaned roster, one row per person |
+| `fte_hr_no_filter` | `a4b68f90-712b-4175-ad24-d50d90698a10` | `Append Rows` | the union of the five sources after their per-source formulas, **before** the shared cleaning and every filter |
+| `hr_data_quality` | `0309c504-2aed-4d2a-ab45-d25233a19182` | `Append Rows 1` | last-update date per source (`workday_ind`, `dayforce_emea_can`, `hris_nam`, `peoplesoft_nam`). The `peoplesoft_nam` branch is enabled in production but disabled in sandbox. |
+
+The app and the main flow both read the roster through the view `consolidated_hr_fte_report_view`
+(`6f93982e-7469-43a2-b0a9-42ebda9b1fd0`), not the dataset directly. The view's definition has not
+been exported.
 
 Unions five regional HR systems into one roster, normalising wildly different schemas:
 
@@ -149,21 +162,53 @@ Unions five regional HR systems into one roster, normalising wildly different sc
 | `NAM HRIS Levels GCP` | NAM | six `dept_descr` values |
 | `dayforce_emea_can_hr_data` | EMEA | `Area = 'Delivery Center'` and `Site <> 'Supply Chain'` |
 | `workday_ind_hr_data` | APAC (India) | GBS L3 hierarchy, excluding Global BPO and Coaching & Outplacement |
-| `gbs_fte_mexico` | NAM (Mexico) | none — whole file |
+| `gbs_fte_mexico_report_feed` | NAM (Mexico) | none — whole file |
 
-Then: `Add Formula 4` copies `department` to `Department Detail`; **`cleaned status and department`**
-does the real normalisation (status → active/inactive, ~30 department-detail values → 9 buckets,
-country spellings, `fte` null → `'1'`); `Filter Rows 4` drops rows with no `person_id` or no
-`manager`; `Filter Rows 3` keeps `end_date IS NULL OR end_date >= '2026-06-29'`; `Rank & Window 1`
-+ `Filter Rows 6` keep one assignment per person (active first, then latest `start_date`);
-`Remove Duplicates` on `(full_name, person_id, start_date)`.
+Then, in order:
 
-**Things to know.** `missing_flag` is set per source with different logic — job-title regex in EMEA
-and Mexico, a department list in NAM, a hierarchy check in India. It means "this person is a manager
-and is not expected to log allocations", and the `missing allocations` cards filter on it. Mexico has
-no employee id at all, so ids are synthesised as `CONCAT('mex', row_num)` ordered by email — **these
-ids are not stable across runs** if the source row set changes. `Filter Rows 3`'s `'2026-06-29'` is a
-hardcoded date. One manager name is hardcoded (`Karen Ann Welch` → `Karen Welch`).
+1. `department rename` copies `department` to `Department Detail`.
+2. **`cleaned status and department`** does the real normalisation: status → active/inactive,
+   ~30 department-detail values → 9 buckets, country spellings, `fte` null → `'1'`,
+   `cost_center_code` null → `'n/a'`, and one hardcoded manager name (`Karen Ann Welch` →
+   `Karen Welch`).
+3. `Filter Rows 4` keeps `person_id IS NOT NULL AND manager IS NOT NULL`.
+4. `Rank & Window 1` + `Filter Rows 6` keep one assignment per person: `RANK()` over `person_id`,
+   ordered `cleaned_status` ascending (so `active` before `inactive`), then latest `start_date`.
+5. `Alter Columns` casts `start_date` / `end_date` to DATE.
+6. `filter end dates before 6_28` keeps
+   `cleaned_status = 'active' OR end_date IS NULL OR end_date >= '2026-06-28'`.
+7. `Remove Duplicates` on `(full_name, person_id, start_date)`.
+
+**How each source builds `manager`, and what a blank one does.** `Filter Rows 4` drops **null**
+managers only. An empty string survives, so whether a blank manager drops the person or keeps them
+with an empty manager depends on the source:
+
+| Source | `manager` comes from | Null in source | Empty string in source |
+|---|---|---|---|
+| PeopleSoft NAM | `Approver Name`, "Last, First" → "First Last" via `CONCAT` | stays null → **dropped** | becomes `' '` → **kept**, blank manager |
+| NAM HRIS | `supervisor_name`, same reformat | **dropped** | becomes `' '` → **kept**, blank manager |
+| Dayforce EMEA | `manager_name` as is | **dropped** | **kept**, `''` |
+| Mexico | `Manager Name` as is | **dropped** | **kept**, `''` |
+| Workday India | the text inside `(…)` in `supervisory_organization`, else explicitly `NULL` | **dropped** | **dropped** — as is anyone whose org string has no parentheses |
+
+A dropped person disappears from the app's pickers and from `fte_full_calendar_allocation`
+entirely, including allocations already logged for them, with no error anywhere. To see who is
+affected, query `fte_hr_no_filter` for `manager IS NULL OR TRIM(manager) = ''`. An empty-string
+manager that survives gets frozen by the main flow's history mechanism (§4.2).
+
+**Other things to know.**
+
+- `missing_flag` means "this person is a manager and is not expected to log allocations", and the
+  `missing allocations` cards filter on it. Each source sets it differently: always `0` in
+  PeopleSoft; a list of management departments in NAM HRIS; `Site = 'management'` or a job-title
+  regex in EMEA; a job-title match in Mexico; `hr_cc_reporting_hierarchy_l4 <> 'core services'` in
+  India.
+- Mexico has no employee id, so ids are synthesised as `CONCAT('mex', row_num)` ordered by email —
+  **these ids are not stable across runs** if the source row set changes. Mexico also has no
+  `start_date`.
+- PeopleSoft has no `fte` column, so every PeopleSoft person gets `fte = '1'`.
+- India's `status` is computed against `CURRENT_DATE()` from the end date, not read from the source.
+- The `'2026-06-28'` cutoff is hardcoded, and applies only to people whose status is not `active`.
 
 ### 4.2 `fte_full_calendar_allocation` (Magic ETL) — the main flow
 
@@ -175,6 +220,10 @@ Publishes three datasets, all **REPLACE**:
 | **`fte_full_calendar_allocation`** | `0ce8e039-d17a-4af9-911d-6d96ff6f7e2e` | `Alter Columns 3` | **person × Monday × cost centre**, including weeks with nothing logged |
 | `fte_targets` | `6346b2b2-4830-4671-a890-a158ae89bb51` | `String Operations` | one row per targets document |
 
+It reads HR through `consolidated_hr_fte_report_view`, keeping the latest `start_date` per
+`person_id`. Cost-centre attributes come from `fte_cost_center_sheet`, joined on
+`cost_center_name = AI level name`.
+
 **Weekly branch.** `weekly_allocation` → tag `allocation_type = 'weekly'` → union with bulk →
 strip the `[id] ` prefix from `allocation_name` → LEFT JOIN to HR on name → `Rank & Window` adds
 `rank` (partitioned by `allocation_date, allocation_name, cost_center_name, allocation_type`,
@@ -183,7 +232,7 @@ source by allocation type, and sets **`previous_fte_value = baseline_fte_value`*
 guidance join.
 
 **Bulk branch.** `bulk_allocation_fte ⨝ bulk_allocation_summary` → drop `UNALLOCATED` →
-count employees per profile → **INNER join to calendar Mondays on
+count employees per profile → **INNER join to calendar Mondays (reporting year 2024 onwards) on
 `allocation_monthyear = DATE_FORMAT(DATE_ADD(Day, INTERVAL 4 DAY), '%b %Y')`** → count weeks per
 profile → `allocation_amount = amount / num_weeks / employee_count`.
 
@@ -192,9 +241,13 @@ So a profile holding 3.0 FTE for a client, covering 6 people, in a 4-week month,
 i.e. the Gregorian axis — see §6.3.
 
 **The skeleton.** Calendar Mondays (`Calendar Reporting Year >= 2026` and `<= YEAR(now)+1`)
-CROSS JOIN the roster = every employee × every in-window Monday, with `skeleton_cost_center =
-'Unassigned'`. `Join Data 7` LEFT OUTER joins the real allocations on `(full_name, person_id, Day)`.
-**Note the join key has no cost centre** — see §10.1.
+CROSS JOIN the roster, then `Filter Rows 5` keeps only Mondays between each person's `start_date`
+and `end_date` (either may be null) = every employee × every in-window Monday they were employed,
+with `skeleton_cost_center = 'Unassigned'`. For anyone with no end date that still runs to the end
+of next year, so **future weeks are published**. `Join Data 7` LEFT OUTER joins the real allocations
+on `(full_name, person_id, Day)`, and takes `manager`, `manager_email` and `fte_country` from the
+roster side. **Note the join key has no cost centre** — see §10.1. **And anyone not on the roster
+gets no rows at all**, even if they have allocations; those still appear in `fte_weekly_allocation`.
 
 **`Add Formula 5` — the semantics tile.** Expressions run in listed order and later ones see earlier
 results:
@@ -218,8 +271,9 @@ results:
 
 **The self-referencing history mechanism.** The flow reads **its own previous output** —
 `fte_full_calendar_allocation_input` points at `0ce8e039`, the same GUID it publishes to. It takes
-`manager`, `department`, `manager_email` per `(person_id, Day)`, de-duplicates on that pair, LEFT
-joins, and `Add Formula 9` does `COALESCE(historical_x, x)`.
+`manager`, `department`, `manager_email` per `(person_id, Day)`, de-duplicates on that pair (subset
+key, confirmed), LEFT joins, and `Add Formula 9` does `COALESCE(historical_x, x)` — except that
+**bulk rows always take the current `department`**.
 
 Intent: freeze org structure as it was when a week was first reported, so a reorg does not restate
 history. Consequence: **whatever value a `(person_id, Day)` receives on its first published run wins
@@ -227,7 +281,17 @@ permanently.** A bad run does not self-heal on re-run — correcting it means cl
 dataset or a one-off run with the COALESCE bypassed. Test structural changes against a scratch output
 dataset first.
 
-`Add Formula 9` also writes `last_updated` as a **formatted string**, not a timestamp.
+Since 2026-10-12 (sandbox and PROD), the frozen value is only used for weeks that have started, and
+only when it is a real value (not empty, and not `'No manager assigned'` for manager). Future weeks
+always follow current HR. Before that, plain `COALESCE` froze future weeks and blank values too, so
+HR manager and department changes never reached reporting. Weeks frozen before the fix keep their
+old values; see
+[`fte_full_calendar_allocation.md` §5 and §6.3a](fte_full_calendar_allocation.md#63a-blank-and-future-values-were-frozen-too-fixed-2026-10-12)
+for the exact expressions and how to restate one person.
+
+`Add Formula 9` also writes `last_updated` as a **formatted string**, not a timestamp, and
+`assigned_fte = fte / NULLIF(distinct_cc_count, 0)` — the person's FTE split evenly across the cost
+centres they have that week (`Group By 3` / `Join Data 12`), the row-level equivalent of `fte2`.
 
 ### 4.3 `fte_allocations_nam_charge` (Magic ETL)
 
@@ -630,8 +694,9 @@ date axis — Gregorian or fiscal? (4) is it a total/subtotal cell of a grain-se
 
 **Someone's allocations are missing.** Check they exist in `weekly_allocation` for the **Monday** of
 that week, not the week-ending date. Then check they survive the HR join — a person absent from
-`consolidated_hr_fte_report` (wrong department filter, `end_date` before the cutoff, no manager) will
-not appear.
+`consolidated_hr_fte_report` (wrong department filter, inactive with `end_date` before the cutoff,
+null manager or `person_id`) will not appear. `fte_hr_no_filter` holds the pre-filter union, so a
+person there but not in the roster was dropped by the HR flow (§4.1).
 
 **A manager appears with no allocations.** Expected if `missing_flag = 1` — that flags managers who
 are not expected to log. The flag is set differently per HR source (§4.1).
@@ -658,9 +723,11 @@ Ranked by how much they would cost to leave unanswered.
 4. **The two drill-target cards** behind the targets cards (`790319402`, `1309369940`).
 5. **What `calculation_1928813c` computes** on `nam fte level allocations` — presumed FTE × charge rate.
 6. **PDP policies** on any of the four views, which would change what each card means per viewer.
-7. **The hardcoded `'2026-06-29'`** in the HR flow's `Filter Rows 3` — what is it, and when does it
-   need moving?
-8. **Whether `fte_nam_charge` is still maintained**, and by whom.
+7. **The hardcoded `'2026-06-28'`** in the HR flow's `filter end dates before 6_28` — what is it, and
+   when does it need moving?
+8. **The definition of `consolidated_hr_fte_report_view`**, which both the app and the main flow read
+   instead of the dataset — any filter in it removes people as silently as `Filter Rows 4` does.
+9. **Whether `fte_nam_charge` is still maintained**, and by whom.
 
 ---
 
