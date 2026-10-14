@@ -52,13 +52,17 @@ const monthValue = (date: Date) => date.getFullYear() * 12 + date.getMonth();
  * derive from it. A week's month is its owning month (the month containing its Friday), not the
  * month its Monday falls in, so a week can be open while the calendar month it starts in is not.
  */
-// Typed as number, not the literal 2: this is meant to be retuned, and a literal type would
-// make the singular branch of EDITABLE_WINDOW_LABEL a compile error.
-const EDITABLE_MONTHS_BACK: number = 2;
+// null turns the lock off entirely — every month is editable. Set it back to a number (it was
+// 2) to restore the window.
+// Typed as number | null, not a literal: this is meant to be retuned, and a literal type would
+// make the other branches of EDITABLE_WINDOW_DESCRIPTION a compile error.
+const EDITABLE_MONTHS_BACK: number | null = null;
 
-const EDITABLE_WINDOW_LABEL = EDITABLE_MONTHS_BACK === 1
-  ? 'the current and previous calendar month'
-  : `the current month and the previous ${EDITABLE_MONTHS_BACK} calendar months`;
+const EDITABLE_WINDOW_DESCRIPTION = EDITABLE_MONTHS_BACK === null
+  ? 'All months are open for editing.'
+  : EDITABLE_MONTHS_BACK === 1
+    ? 'Edits permitted for the current and previous calendar month only.'
+    : `Edits permitted for the current month and the previous ${EDITABLE_MONTHS_BACK} calendar months only.`;
 
 /**
  * A weekly cell's value.
@@ -500,6 +504,7 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
 
   const isWeekEditable = useCallback((weekStartDate: Date) => {
     if (!todayRef) return false;
+    if (EDITABLE_MONTHS_BACK === null) return true;
 
     // Weeks whose owning month falls outside the EDITABLE_MONTHS_BACK window are closed.
     return monthValue(getOwningMonth(weekStartDate)) >= (monthValue(todayRef) - EDITABLE_MONTHS_BACK);
@@ -1000,7 +1005,7 @@ export function MultiWeekGrid({ currentDate, setCurrentDate, onSaveSuccess, init
                 )}
               </div>
               <CardDescription>
-                Edits permitted for {EDITABLE_WINDOW_LABEL} only. Sorted by first name.
+                {EDITABLE_WINDOW_DESCRIPTION} Sorted by first name.
               </CardDescription>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
