@@ -113,7 +113,7 @@ Three dataflows, seven published datasets, four views, two dashboards, 29 cards.
 
 ## 3. The source application
 
-A Domo custom app (Next.js), source at `github.com/alex-paratore-randstad/fte_tool`. Managers enter
+A Domo custom app (Next.js), source at `github.com/res-alex-paratore/fte_tool`. Managers enter
 allocations; the app writes AppDB collections that the main dataflow reads.
 
 | Collection | Written by | Grain |
@@ -742,5 +742,5 @@ Raw exports live in [`_domo_export/`](_domo_export/). Related documents in this 
 | [`_domo_export/beast_modes.md`](_domo_export/beast_modes.md) | Environment A's Beast Mode formulas |
 | [`domo_sql/`](domo_sql/) | the shelved densification dataflow and its runbook |
 
-The application source is `github.com/alex-paratore-randstad/fte_tool`; the allocation grid is
+The application source is `github.com/res-alex-paratore/fte_tool`; the allocation grid is
 `src/components/allocation/multi-week-grid.tsx` and the calendar rule is `src/lib/fiscal-calendar.ts`.
