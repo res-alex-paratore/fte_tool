@@ -50,3 +50,6 @@ domo-config.json
 .claude/
 .cursor/
 *.local
+
+__pycache__/
+*.pyc
