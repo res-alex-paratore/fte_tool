@@ -46,6 +46,7 @@ const navGroups: NavGroup[] = [
       { href: '/team', label: 'Team Management' },
       { href: '/cost-centers', label: 'Client Management', roles: ['admin'] },
       { href: '/title_management', label: 'Title Management', roles: ['admin', 'manager'] },
+      { href: '/hr-data-issues', label: 'HR Data Issues' },
     ]
   },
   {

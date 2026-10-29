@@ -234,6 +234,21 @@
                     "columnName": "Reporting Week Date"
                 }
             ]
+        },
+        {
+            "dataSetId": "a4b68f90-712b-4175-ad24-d50d90698a10",
+            "alias": "fte_hr_no_filter",
+            "fields": []
+        },
+        {
+            "dataSetId": "9153b05c-1a1d-408b-ae77-e1147555ba30",
+            "alias": "hr_roster_history",
+            "fields": []
+        },
+        {
+            "dataSetId": "0309c504-2aed-4d2a-ab45-d25233a19182",
+            "alias": "hr_data_quality",
+            "fields": []
         }
     ],
     "collectionsMapping": [
@@ -591,6 +606,128 @@
                     },
                     {
                         "name": "log_raw",
+                        "type": "STRING"
+                    }
+                ]
+            },
+            "syncEnabled": true,
+            "defaultPermission": [
+                "read",
+                "read_content",
+                "create_content",
+                "update_content"
+            ]
+        },
+        {
+            "name": "hr_data_issues",
+            "schema": {
+                "columns": [
+                    {
+                        "name": "issue_id",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "created_date",
+                        "type": "DATE"
+                    },
+                    {
+                        "name": "reported_by",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "reported_by_email",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "raised_on_behalf_of",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "person_id",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "person_name",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "person_email",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "hr_source",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "region",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "manager",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "issue_type",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "field",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "current_value",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "expected_value",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "effective_date",
+                        "type": "DATE"
+                    },
+                    {
+                        "name": "description",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "stage",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "diagnosis",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "diagnosis_detail",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "assigned_team",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "status",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "related_ticket",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "updates",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "resolution",
+                        "type": "STRING"
+                    },
+                    {
+                        "name": "resolved_date",
+                        "type": "DATE"
+                    },
+                    {
+                        "name": "source_snapshot",
                         "type": "STRING"
                     }
                 ]

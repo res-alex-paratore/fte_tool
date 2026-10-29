@@ -147,7 +147,7 @@ Publishes three datasets, all **REPLACE**:
 | Output | GUID | Fed by | Contents |
 |---|---|---|---|
 | **`consolidated_hr_fte_report`** | `6d199fbe-6a26-479f-8a0f-aae022372648` | `Remove Duplicates` | the cleaned roster, one row per person |
-| `fte_hr_no_filter` | `a4b68f90-712b-4175-ad24-d50d90698a10` | `Append Rows` | the union of the five sources after their per-source formulas, **before** the shared cleaning and every filter |
+| `fte_hr_no_filter` | `a4b68f90-712b-4175-ad24-d50d90698a10` | `Append Rows 2` | a separate, unfiltered branch: four sources (no Mexico) after their per-source formulas, **before** the per-source filters, the shared cleaning and every other filter. `docs/domo_hr_history/hr_source_columns.md` adds `hr_source`, the Dayforce `Area` / Workday L4 filter columns, and Mexico. |
 | `hr_data_quality` | `0309c504-2aed-4d2a-ab45-d25233a19182` | `Append Rows 1` | last-update date per source (`workday_ind`, `dayforce_emea_can`, `hris_nam`, `peoplesoft_nam`). The `peoplesoft_nam` branch is enabled in production but disabled in sandbox. |
 
 The app and the main flow both read the roster through the view `consolidated_hr_fte_report_view`
@@ -169,9 +169,11 @@ Then, in order:
 1. `department rename` copies `department` to `Department Detail`.
 2. **`cleaned status and department`** does the real normalisation: status → active/inactive,
    ~30 department-detail values → 9 buckets, country spellings, `fte` null → `'1'`,
-   `cost_center_code` null → `'n/a'`, and one hardcoded manager name (`Karen Ann Welch` →
-   `Karen Welch`).
-3. `Filter Rows 4` keeps `person_id IS NOT NULL AND manager IS NOT NULL`.
+   `cost_center_code` null → `'n/a'`, null or blank `manager` → `'No manager assigned'`, and one
+   hardcoded manager name (`Karen Ann Welch` → `Karen Welch`).
+3. `Filter Rows 4` keeps `person_id IS NOT NULL AND manager IS NOT NULL`. Because step 2 already
+   filled in blank managers, this only drops a null `person_id` (for Dayforce, a missing local
+   employee ID).
 4. `Rank & Window 1` + `Filter Rows 6` keep one assignment per person: `RANK()` over `person_id`,
    ordered `cleaned_status` ascending (so `active` before `inactive`), then latest `start_date`.
 5. `Alter Columns` casts `start_date` / `end_date` to DATE.
@@ -179,22 +181,18 @@ Then, in order:
    `cleaned_status = 'active' OR end_date IS NULL OR end_date >= '2026-06-28'`.
 7. `Remove Duplicates` on `(full_name, person_id, start_date)`.
 
-**How each source builds `manager`, and what a blank one does.** `Filter Rows 4` drops **null**
-managers only. An empty string survives, so whether a blank manager drops the person or keeps them
-with an empty manager depends on the source:
+**How each source builds `manager`.** A null or blank manager no longer drops anyone:
+`cleaned status and department` turns it into `'No manager assigned'` before `Filter Rows 4`. Those
+people stay in the roster, and the main flow's history mechanism (§4.2) freezes that placeholder.
+To find them, query the roster for `manager = 'No manager assigned'`.
 
-| Source | `manager` comes from | Null in source | Empty string in source |
-|---|---|---|---|
-| PeopleSoft NAM | `Approver Name`, "Last, First" → "First Last" via `CONCAT` | stays null → **dropped** | becomes `' '` → **kept**, blank manager |
-| NAM HRIS | `supervisor_name`, same reformat | **dropped** | becomes `' '` → **kept**, blank manager |
-| Dayforce EMEA | `manager_name` as is | **dropped** | **kept**, `''` |
-| Mexico | `Manager Name` as is | **dropped** | **kept**, `''` |
-| Workday India | the text inside `(…)` in `supervisory_organization`, else explicitly `NULL` | **dropped** | **dropped** — as is anyone whose org string has no parentheses |
-
-A dropped person disappears from the app's pickers and from `fte_full_calendar_allocation`
-entirely, including allocations already logged for them, with no error anywhere. To see who is
-affected, query `fte_hr_no_filter` for `manager IS NULL OR TRIM(manager) = ''`. An empty-string
-manager that survives gets frozen by the main flow's history mechanism (§4.2).
+| Source | `manager` comes from | Blank or null in source |
+|---|---|---|
+| PeopleSoft NAM | `Approver Name`, "Last, First" → "First Last" via `CONCAT` | `'No manager assigned'` (a blank becomes `' '`, which `TRIM` catches) |
+| NAM HRIS | `supervisor_name`, same reformat | `'No manager assigned'` |
+| Dayforce EMEA | `manager_name` as is | `'No manager assigned'` |
+| Mexico | `Manager Name` as is | `'No manager assigned'` |
+| Workday India | the text inside `(…)` in `supervisory_organization`, else `NULL` | `'No manager assigned'`, as is anyone whose org string has no parentheses |
 
 **Other things to know.**
 
@@ -695,8 +693,9 @@ date axis — Gregorian or fiscal? (4) is it a total/subtotal cell of a grain-se
 **Someone's allocations are missing.** Check they exist in `weekly_allocation` for the **Monday** of
 that week, not the week-ending date. Then check they survive the HR join — a person absent from
 `consolidated_hr_fte_report` (wrong department filter, inactive with `end_date` before the cutoff,
-null manager or `person_id`) will not appear. `fte_hr_no_filter` holds the pre-filter union, so a
-person there but not in the roster was dropped by the HR flow (§4.1).
+null `person_id`, losing the assignment rank) will not appear. `fte_hr_no_filter` holds the pre-filter union, so a
+person there but not in the roster was dropped by the HR flow (§4.1). The app's **HR Data Issues**
+page runs this check for one person and names the step (`docs/hr_data_issues.md`).
 
 **A manager appears with no allocations.** Expected if `missing_flag = 1` — that flags managers who
 are not expected to log. The flag is set differently per HR source (§4.1).

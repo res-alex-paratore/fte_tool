@@ -9,6 +9,7 @@ import { getFullName, getPersonId, normalizeHrRoster } from '@/lib/hr-roster';
 export type CurrentUser = {
   id: string;
   name: string;
+  email?: string;
   role: 'manager' | 'admin' | 'vp';
   title?: string;
   region?: 'HYD' | 'EMEA' | 'NAM' | 'Central';
@@ -73,6 +74,7 @@ export function useCurrentUser() {
                 setCurrentUser({
                     id: liveUser.id.toString(),
                     name: liveUser.displayName || 'User',
+                    email: liveUser.emailAddress || liveUser.email || '',
                     title: liveUser.title || '',
                     role: role,
                 });
